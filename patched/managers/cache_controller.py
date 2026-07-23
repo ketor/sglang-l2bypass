@@ -46,6 +46,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.device_page_meta import consecutive_ok_pages
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.utils import get_device_module
 
@@ -65,6 +66,45 @@ def env_l2_bypass() -> bool:
         "no",
         "off",
     )
+
+
+def env_l2_bypass_sync_read() -> bool:
+    """Escape hatch: SGLANG_HICACHE_L2_BYPASS_SYNC_READ=1 reverts the L2-bypass
+    READ path to the increment-2 synchronous form (the on-demand SG GET runs on the
+    scheduler thread inside init_load_back). Default OFF => the increment-3 async
+    read path (background device-load thread; check_prefetch_progress parks the
+    request until every rank's local GET is done). Only meaningful when
+    SGLANG_HICACHE_L2_BYPASS=1; ignored otherwise. Provided for A/B and safety."""
+    return os.environ.get(
+        "SGLANG_HICACHE_L2_BYPASS_SYNC_READ", "0"
+    ).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+class DeviceLoadTask:
+    """L2-bypass async read (increment 3): one on-demand device-direct load handed
+    to the background device-load thread.
+
+    Division of labor (the TP-safety contract): the SCHEDULER thread allocates the
+    GPU slots (and, for DSA, the transient sidecar host staging) and builds this
+    task; the BACKGROUND thread runs ONLY the blocking backend GET
+    (batch_get_v1_device / batch_get_v2_device) plus the local per-rank page
+    verification — NO CUDA stream ops, NO collectives. The scheduler thread then
+    does the TP MIN all_reduces, the sidecar H2D (DSA), and the radix-tree
+    promotion. `done` is a plain threading.Event; check_prefetch_progress polls it
+    (via a per-round TP MIN reduce over every rank's 0/1 done flag), so ranks whose
+    background GET finishes at different wall-clock times still run an identical,
+    balanced collective sequence."""
+
+    def __init__(self, hash_values, device_indices, sidecars=None, side_host=None):
+        self.hash_values = hash_values
+        self.device_indices = device_indices
+        # DSA/hybrid only: the sidecar PoolTransfers (indexer -> side_host staging)
+        # and the staging tensor to free after the H2D. None for dense bypass.
+        self.sidecars = sidecars
+        self.side_host = side_host
+        self.ok_pages = 0
+        self.error = None
+        self.done = threading.Event()
 
 
 class LayerLoadingEvent:
@@ -266,6 +306,14 @@ class HiCacheController:
         # supports_device_transfer(). Off => byte-identical to stock.
         self.l2_bypass_requested = env_l2_bypass()
         self.l2_bypass = False
+        # Increment 3: async device-direct read. When l2_bypass is on and this is
+        # False (default), the on-demand read runs on a background thread; True
+        # keeps the increment-2 synchronous read. Inert unless l2_bypass.
+        self.l2_bypass_sync_read = env_l2_bypass_sync_read()
+        # Background device-load thread + its queue (created in _start_storage_
+        # threads only when l2_bypass and async read are on). None otherwise.
+        self.device_load_queue: Optional[Queue] = None
+        self.device_load_thread: Optional[threading.Thread] = None
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -385,6 +433,16 @@ class HiCacheController:
         self.prefetch_thread.start()
         self.backup_thread.start()
 
+        # Increment 3: the background device-load thread consumes DeviceLoadTasks
+        # (blocking SG GETs into GPU slots). Only spun up for async L2-bypass read;
+        # stock and sync-read paths never create it (byte-identical to stock off).
+        if self.l2_bypass and not self.l2_bypass_sync_read:
+            self.device_load_queue = Queue()
+            self.device_load_thread = threading.Thread(
+                target=self.device_load_thread_func, daemon=True
+            )
+            self.device_load_thread.start()
+
     def _stop_storage_threads(self):
         """Stop storage prefetch/backup threads and drain internal queues.
 
@@ -405,6 +463,8 @@ class HiCacheController:
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
                 self.prefetch_buffer.put_nowait(None)
+            if self.device_load_queue is not None:
+                self.device_load_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -416,6 +476,8 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        if self.device_load_thread is not None:
+            threads.append(self.device_load_thread)
 
         for t in threads:
             try:
@@ -430,6 +492,11 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+
+        # Device-load thread has stopped (joined above); clear its handles so a
+        # subsequent attach re-creates a fresh thread + queue.
+        self.device_load_thread = None
+        self.device_load_queue = None
 
     def attach_storage_backend(
         self,
@@ -508,6 +575,25 @@ class HiCacheController:
 
             self._maybe_enable_l2_bypass()
             self._maybe_register_draft_with_storage()
+
+            if self.l2_bypass:
+                # Increment 3 (gate #1 re-anchor): the stock speculative-prefetch
+                # budget is 0.5 * host-pool tokens (staging L2). L2-bypass keeps no
+                # host staging for the main KV; the resource an in-flight read
+                # actually occupies is GPU KV slots. Re-anchor the rate-limit budget
+                # to a fraction of the DEVICE token capacity so
+                # prefetch_rate_limited() throttles new discoveries by GPU pressure,
+                # not by a host pool that bypass barely uses. 0.3x leaves headroom
+                # for running batches + write-through pins. prefetch_tokens_occupied
+                # is charged in device tokens by the async read path.
+                device_capacity = int(self.mem_pool_device_allocator.size)
+                self.prefetch_capacity_limit = int(0.3 * device_capacity)
+                logger.info(
+                    "HiCache L2-bypass: prefetch_capacity_limit re-anchored to "
+                    "0.3 * device token capacity = %d tokens (was 0.5 * host = %d).",
+                    self.prefetch_capacity_limit,
+                    int(0.5 * self.mem_pool_host.size),
+                )
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -662,6 +748,17 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+            if self.device_load_thread is not None:
+                # Wake + join the background device-load thread, then drop its queue
+                # (any in-flight DeviceLoadTask is abandoned; the tree is being
+                # reset, so its GPU slots go with the pool wipe).
+                try:
+                    self.device_load_queue.put_nowait(None)
+                except Exception:
+                    pass
+                self.device_load_thread.join()
+                self.device_load_queue = None
+                self.device_load_thread = None
 
         self.storage_stop_event.clear()
 
@@ -674,6 +771,12 @@ class HiCacheController:
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
+            if self.l2_bypass and not self.l2_bypass_sync_read:
+                self.device_load_queue = Queue()
+                self.device_load_thread = threading.Thread(
+                    target=self.device_load_thread_func, daemon=True
+                )
+                self.device_load_thread.start()
 
     def write(
         self,
@@ -833,6 +936,80 @@ class HiCacheController:
         op = CacheOperation(host_placeholder, device_indices, -1)
         op.node_ids = list(node_ids)
         self.load_queue.append(op)
+
+    # ---- Increment 3: async device-direct read (background load thread) --------
+    #
+    # make_device_load_task / submit_device_load / _run_device_get /
+    # finalize_device_load / free_device_load split the increment-2 synchronous
+    # load_device_direct across the scheduler/background thread boundary:
+    #   scheduler thread : make_device_load_task (alloc GPU slots) -> submit ->
+    #                       [park] -> finalize (dense: no-op) + free suffix
+    #   background thread : _run_device_get (blocking SG GET + local verify)
+    # The dense (v1) versions live here; HybridCacheController overrides them for
+    # the DSA v2-device split value + sidecar H2D.
+
+    def make_device_load_task(
+        self, hash_values: List[str]
+    ) -> Optional["DeviceLoadTask"]:
+        """Allocate GPU KV slots for len(hash_values) pages (scheduler thread). No
+        GET yet. Returns None if the device allocation failed (the caller may evict
+        and retry, mirroring load()). No collective — the TP alloc-consistency MIN
+        is the caller's job."""
+        total_tokens = len(hash_values) * self.page_size
+        device_indices = self.mem_pool_device_allocator.alloc(total_tokens)
+        if device_indices is None:
+            return None
+        return DeviceLoadTask(hash_values, device_indices)
+
+    def submit_device_load(self, task: "DeviceLoadTask") -> None:
+        """Hand a built task to the background device-load thread (scheduler
+        thread). The thread will run the blocking GET and set task.done."""
+        self.device_load_queue.put(task)
+
+    def _run_device_get(self, task: "DeviceLoadTask") -> int:
+        """Background thread: the blocking scatter-gather GET into the pre-allocated
+        GPU slots + local hit-prefix count. Dense v1. No CUDA ops, no collective."""
+        results = self.storage_backend.batch_get_v1_device(
+            task.hash_values, task.device_indices
+        )
+        return consecutive_ok_pages(results, [], len(task.hash_values))
+
+    def finalize_device_load(self, task: "DeviceLoadTask", ok_pages: int) -> None:
+        """Scheduler thread, at promotion: dense bypass has nothing to finalize (the
+        SG GET already wrote the GPU slots). Hybrid overrides to H2D the sidecar."""
+        return
+
+    def free_device_load(self, task: "DeviceLoadTask") -> None:
+        """Free a task's GPU slots (abort path, scheduler thread). Idempotent."""
+        if task.device_indices is not None:
+            self.mem_pool_device_allocator.free(task.device_indices)
+            task.device_indices = None
+
+    def free_device_indices(self, device_indices: torch.Tensor) -> None:
+        """Free a span of device KV slots (used by the tree to release the unverified
+        suffix after a partial load). Base = the plain allocator; hybrid overrides to
+        the full-attn allocator that owns the main-KV slots."""
+        self.mem_pool_device_allocator.free(device_indices)
+
+    def device_load_thread_func(self):
+        """Background consumer of DeviceLoadTasks: run each blocking GET, record the
+        local verified page count, signal done. Never touches CUDA streams,
+        collectives, or the radix tree — those stay on the scheduler thread."""
+        while not self.storage_stop_event.is_set():
+            try:
+                task = self.device_load_queue.get(block=True, timeout=1)
+            except Empty:
+                continue
+            if task is None:
+                continue
+            try:
+                task.ok_pages = self._run_device_get(task)
+            except Exception as e:
+                logger.exception("device-direct background GET failed: %s", e)
+                task.error = e
+                task.ok_pages = 0
+            finally:
+                task.done.set()
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing

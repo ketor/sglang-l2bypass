@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
+    DeviceLoadTask,
     HiCacheAck,
 )
 from sglang.srt.managers.cache_controller import (
@@ -23,6 +24,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.device_page_meta import consecutive_ok_pages
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageExtraInfo,
@@ -760,6 +762,93 @@ class HybridCacheController(BaseHiCacheController):
         op = CacheOperation(host_placeholder, device_indices, -1)
         op.node_ids = list(node_ids)
         self.load_queue.append(op)
+
+    # ---- Increment 3: async device-direct read (DSA overrides) -----------------
+    #
+    # Split the synchronous load_device_direct across the thread boundary exactly
+    # like the dense base, but the DSA read is a split value: the background thread
+    # RDMAs the main MLA latent into the GPU slots AND reads the indexer sidecar
+    # into a transient HOST staging span (batch_get_v2_device — pure C/RDMA + host
+    # memcpy, no CUDA). The sidecar H2D (a CUDA op) is deferred to the scheduler
+    # thread in finalize_device_load, keeping all CUDA + collectives off the
+    # background thread.
+
+    def _full_allocator(self):
+        return getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+
+    def make_device_load_task(
+        self, hash_values: List[str]
+    ) -> Optional[DeviceLoadTask]:
+        """Alloc GPU main-KV slots + transient sidecar host staging + build the
+        sidecar PoolTransfers (scheduler thread). None if either alloc fails (the
+        caller evicts + retries). No GET, no CUDA."""
+        total_tokens = len(hash_values) * self.page_size
+        full_allocator = self._full_allocator()
+        device_indices = full_allocator.alloc(total_tokens)
+        if device_indices is None:
+            return None
+        side_host = self.mem_pool_host.alloc(total_tokens)
+        if side_host is None:
+            full_allocator.free(device_indices)
+            return None
+        sidecars = [
+            PoolTransfer(
+                name=e.name,
+                host_indices=side_host,
+                device_indices=device_indices,
+                keys=list(hash_values),
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+            for e in self._sidecar_entries()
+        ]
+        return DeviceLoadTask(
+            hash_values, device_indices, sidecars=sidecars, side_host=side_host
+        )
+
+    def _run_device_get(self, task: DeviceLoadTask) -> int:
+        """Background thread: batch_get_v2_device fills the main KV via RDMA (device
+        slots) AND the indexer into task.side_host (host staging). Count the prefix
+        where the main KV AND every sidecar page hit. NO H2D here (deferred to
+        finalize on the scheduler thread)."""
+        results = self.storage_backend.batch_get_v2_device(
+            task.hash_values, task.device_indices, task.sidecars
+        )
+        kv_ok = results.get("kv") or []
+        sidecar_oks = [
+            results.get(str(e.name)) or [] for e in self._sidecar_entries()
+        ]
+        return consecutive_ok_pages(kv_ok, sidecar_oks, len(task.hash_values))
+
+    def finalize_device_load(self, task: DeviceLoadTask, ok_pages: int) -> None:
+        """Scheduler thread, at promotion: H2D the verified sidecar prefix from the
+        host staging into its device index buffer (at the main-KV slots), then free
+        the staging. After this the GPU slots hold both latent and indexer."""
+        if ok_pages > 0 and task.side_host is not None:
+            self._sidecar_h2d(
+                task.side_host, task.device_indices, task.sidecars, ok_pages
+            )
+        if task.side_host is not None:
+            self.mem_pool_host.free(task.side_host)
+            task.side_host = None
+
+    def free_device_load(self, task: DeviceLoadTask) -> None:
+        """Abort path (scheduler thread): free the main-KV GPU slots + the sidecar
+        host staging. Idempotent."""
+        if task.device_indices is not None:
+            self._full_allocator().free(task.device_indices)
+            task.device_indices = None
+        if task.side_host is not None:
+            self.mem_pool_host.free(task.side_host)
+            task.side_host = None
+
+    def free_device_indices(self, device_indices: torch.Tensor) -> None:
+        """Free a span of main-KV device slots via the full-attn allocator that owns
+        them (the tree uses this to release an unverified load suffix)."""
+        self._full_allocator().free(device_indices)
 
     def start_loading(self) -> int:
         if not self.load_queue:

@@ -25,7 +25,29 @@ read. Increment 1 wires the write path and its offload; enabling it in isolation
 is a benchmark/prototype mode. See PATCH-MANIFEST.md.
 """
 
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
+
+
+def consecutive_ok_pages(
+    kv_ok: Sequence[bool],
+    sidecar_oks: Sequence[Sequence[bool]],
+    npages: int,
+) -> int:
+    """Longest consecutive page prefix (from the start) where the main KV AND every
+    sidecar hit — the verified prefix of an L2-bypass device-direct GET (increment
+    2/3). A page is usable only if it and all before it are complete, so the first
+    miss / short-read list truncates the prefix and the caller recomputes the tail
+    rather than serving a hole. Pure logic (no torch/GPU) so it is unit-testable off
+    the GPU box; used by HiCacheController._run_device_get (dense, sidecar_oks=[])
+    and HybridCacheController._run_device_get (DSA main KV + indexer sidecars)."""
+    ok = 0
+    for p in range(npages):
+        if p >= len(kv_ok) or not kv_ok[p]:
+            break
+        if any(p >= len(s) or not s[p] for s in sidecar_oks):
+            break
+        ok += 1
+    return ok
 
 
 def _mla_layer_bases(pool) -> Tuple[List[int], int]:

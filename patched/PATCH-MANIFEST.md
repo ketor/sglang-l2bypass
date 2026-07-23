@@ -449,3 +449,181 @@ dfkv side (real cache node, no GPU): `test/python/test_dfkv_hicache_device_direc
 - **Split-chain sidecar path** (a write-through node split between enqueue and
   backup) concatenates the chain's `bypass_sidecar_host`; review-verified, not
   GPU-exercised.
+
+---
+
+# Increment 3 — async device-direct READ + read-hit no-re-PUT + gate re-anchor
+
+Three changes on top of increments 1/2/2.5. All still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1`; with it off, byte-identical to stock. **No new
+bind-mount files** — every change lives in the already-mounted
+`hiradix_cache.py` / `managers/cache_controller.py` /
+`hybrid_cache/hybrid_cache_controller.py` / `device_page_meta.py`, plus the
+existing dfkv backend mount. Dense (v1) and DSA hybrid (v2) are both covered.
+
+## Task 1 — async read (background device-load thread)
+
+The increment-2 read ran the on-demand SG GET **synchronously on the scheduler
+thread** inside `init_load_back` (GLM 100k R3 TTFT median 29.2s — worse than the
+cold round). Increment 3 moves the GET to a background thread and parks the
+request in the waiting queue until it lands, reusing SGLang's existing
+`check_prefetch_progress` → `continue` wait gate (stock scheduler.py:2886-2889) —
+**no scheduler patch**.
+
+New sub-flag `SGLANG_HICACHE_L2_BYPASS_SYNC_READ` (default **off** = async). Set
+to 1 to keep the increment-2 synchronous read (A/B and safety escape hatch).
+
+### The read state machine (async), all in `hiradix_cache.py`
+`check_prefetch_progress` (bypass, async) dispatches per req_id to:
+1. **`_start_l3_async_load`** (round 1, from `_pending_l3_discovery`): exist query +
+   cross-rank MIN (gate #3) + threshold (gate #2) + `_insert_helper_l3` markers
+   [as increment 2]; then collect the evicted l3-marker chain, allocate GPU slots
+   (`make_device_load_task`, evict+retry once), **alloc-success MIN**, submit the
+   GET to the background thread, pin the ancestor, and **return False** (park).
+2. **`_poll_l3_async_load`** (rounds 2..N, from `_bypass_load_state`): **one balanced
+   TP MIN over every rank's 0/1 "background GET done?" flag, every round**. Return
+   False (park) until the MIN is 1 (slowest rank landed).
+3. **`_promote_l3_async_load`** (final round): **verified-page MIN**, DSA sidecar
+   H2D (`finalize_device_load`, scheduler thread), assign the verified marker
+   prefix as device-resident, drop the failed suffix, `enqueue_device_load` (the
+   fence), release the ancestor pin, return True. The nodes are now device-resident,
+   so the unpatched `match_prefix`/`init_load_back` find them as a device hit and do
+   NOT re-load.
+
+### Background thread (`managers/cache_controller.py`)
+- `DeviceLoadTask` — one in-flight load (hash_values, pre-allocated device_indices,
+  DSA sidecars + host staging, `ok_pages`, `done` threading.Event).
+- `device_load_thread_func` / `_run_device_get` — the thread runs **only** the
+  blocking `batch_get_v1_device` / `batch_get_v2_device` + the local page count
+  (`device_page_meta.consecutive_ok_pages`). **No CUDA stream ops, no collectives.**
+- `make_device_load_task` / `submit_device_load` / `finalize_device_load` /
+  `free_device_load` / `free_device_indices` — the scheduler-thread halves (alloc,
+  enqueue, DSA sidecar H2D at promotion, frees). Hybrid overrides all of them for
+  the v2-device split value.
+- Thread lifecycle: started in `_start_storage_threads` **only when
+  `l2_bypass and not l2_bypass_sync_read`**; joined in `_stop_storage_threads`;
+  restarted in `reset`.
+
+### 🔴 TP-consistency (the correctness-critical piece)
+All `all_reduce`s stay on the scheduler thread; the background thread does the
+per-rank GET + verify only. Ranks finish at different wall-clock rounds, so the
+gate is **polled**: EVERY rank runs one done-MIN EVERY round for a parked request
+(not "reduce only when I'm done", which would desync). When the MIN is 1, all ranks
+do the page-count MIN + promotion **in the same round**. Result: for one request
+every rank issues the identical collective sequence
+`exist [, alloc [, done×k, pages]]`. Proven by
+`tests/test_async_read_state_machine.py::TestCollectiveBalance` (ranks with
+divergent completion rounds emit identical tag sequences). Cost of the extra
+per-round done-MIN: one `int` all_reduce per parked request per round (a few µs
+over NVLink); bounded by the gate-#1 rate limit below.
+
+### GPU-slot lifecycle (pinning)
+The device slots are allocated on the scheduler thread and held by
+`DeviceLoadTask.device_indices` in `_bypass_load_state`; they are NOT attached to a
+tree node during the GET, so eviction cannot touch them and the allocator will not
+rehand them. The marker chain + ancestor are protected by the ancestor
+`inc_lock_ref` held across the loading window (markers themselves carry no
+value/host_value, so no eviction path touches them). On promotion the verified
+slots become node `.value` (evictable via the node), the unverified suffix is freed
+(`free_device_indices`), and the fence pins `last_loaded` until `loading_check`.
+On abort/detach/reset (`_abort_async_load`) the task's `done` is awaited (bounded
+RDMA) before its slots/staging are freed, the markers dropped, and the ancestor
+unpinned. Lock-ref accounting is balanced on every path (success / below-threshold /
+nothing-loadable / alloc-fail / 0-verified / abort).
+
+### Deviation from the brief (honest)
+The brief suggested "record a CUDA event on completion; gate on event ready". Cross-
+thread CUDA event ordering is exactly what increment 2 flagged as *not safely
+expressible at the Python layer*. Instead: the background completion is a **CPU
+`threading.Event`** (polled via the per-round MIN), and the compute-ordering fence
+is the **existing** `LayerDoneCounter` mechanism recorded on the scheduler thread in
+`start_loading` (a blocking RDMA GET means the writes are CPU-observed done before
+promotion, so recording the fence after promotion gives the same happens-before the
+synchronous increment-2 path already relied on). Same guarantee, no new cross-thread
+CUDA primitive.
+
+## Task 2 — read-hit no re-PUT
+
+A node made device-resident by a device-direct READ came FROM L3, so it is already
+backed. `_promote_l3_async_load` (and the sync `load_from_storage_device`) now set
+`node.l3_backed = True` alongside `l3_present = False`. `_inc_hit_count`'s
+already-backed gate (`node.backuped or (l2_bypass and _node_l3_backed(node))`) then
+skips the redundant write-through/backup PUT after the read — eliminating the R3
+`batch_set` re-probe. `_split_node` already propagates `l3_backed`; a read-loaded
+node has no `write_through_pending_id`, so `_replace_pending_write_through_node`
+early-returns (no spurious tracking).
+
+## Task 3 — gate #1 re-anchor + gate #4 cleanup
+
+- **Gate #1** (`prefetch_capacity_limit`, `attach_storage_backend`): stock budgets
+  speculative prefetch at `0.5 * host-pool tokens` (staging L2). Bypass keeps no
+  host staging for the main KV, so under bypass it is re-anchored to
+  `0.3 * device token capacity` (`mem_pool_device_allocator.size`) — the resource an
+  in-flight device-direct read actually occupies. The async read charges
+  `prefetch_tokens_occupied` in **device** tokens (at submit) and releases it (at
+  promotion/abort), so `prefetch_rate_limited()` now throttles new discoveries by
+  GPU pressure. TP-safe: the charge is identical across ranks (post-MIN page count).
+- **Gate #4** (host-full prefetch skip): already replaced by increment 2's on-demand
+  load. Confirmed the only residual host-size dependency for the prefetch budget was
+  gate #1 (re-anchored above); the bypass `prefetch_from_storage` allocates no host
+  slots.
+
+## Changed files / functions (increment 3)
+
+### mem_cache/device_page_meta.py
+- `consecutive_ok_pages(kv_ok, sidecar_oks, npages)` (NEW, pure) — the verified-hit
+  prefix count, shared by dense + hybrid `_run_device_get`; unit-tested off-GPU.
+
+### managers/cache_controller.py
+- `env_l2_bypass_sync_read()` (NEW), `self.l2_bypass_sync_read`.
+- `DeviceLoadTask` (NEW).
+- `attach_storage_backend` — gate-#1 re-anchor when `l2_bypass`.
+- `_start_storage_threads` / `_stop_storage_threads` / `reset` — device-load thread
+  lifecycle (created only for async bypass).
+- `make_device_load_task` / `submit_device_load` / `_run_device_get` /
+  `finalize_device_load` / `free_device_load` / `free_device_indices` /
+  `device_load_thread_func` (NEW). `load_device_direct` (increment 2, sync) is kept
+  for `SYNC_READ` mode.
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py
+- Overrides of the six device-load methods above: `make_device_load_task` (alloc
+  main-KV slots + sidecar host staging + sidecar PoolTransfers), `_run_device_get`
+  (`batch_get_v2_device`, no H2D), `finalize_device_load` (sidecar H2D + free
+  staging), `free_device_load` / `free_device_indices` (full-attn allocator), plus
+  `_full_allocator`.
+
+### mem_cache/hiradix_cache.py
+- `_BypassLoadState` (NEW), `self._bypass_load_state`, `l2_bypass_sync_read` property.
+- `check_prefetch_progress` — async dispatch (`_advance_l3_async`) vs sync
+  (`_run_l3_discovery`).
+- `_l3_exist_query` / `_advance_l3_async` / `_start_l3_async_load` /
+  `_poll_l3_async_load` / `_promote_l3_async_load` / `_abort_async_load` (NEW).
+- `load_from_storage_device` (sync) — `l3_backed=True` on verified nodes;
+  `free_device_indices` for the frees (hybrid-correct).
+- `reset` / `release_aborted_request` / `_force_release_pending_storage_ops` —
+  `_bypass_load_state` cleanup.
+
+## Tests (increment 3)
+`tests/test_async_read_state_machine.py` (pure python, no GPU):
+- `TestConsecutiveOkPages` (8) — dense + hybrid verified-prefix counting.
+- `TestCollectiveBalance` (5) — ranks with divergent GET-completion rounds emit
+  identical collective-tag sequences (the TP-balance invariant).
+Also updated the stale `test_device_page_meta.py::test_supported_...` to assert
+DSA main-latent IS supported (increment 2.5 lifted the veto).
+
+## Known limitations / deviations (increment 3)
+- **SGLang-side verified by py_compile + review + pure-logic unit tests only** (no
+  GPU on the dev box). The async state machine's tree/CUDA coupling (marker
+  climb, slot assignment, fence) is review-verified; the extractable logic (hit
+  counting, collective balance) is unit-tested. Requires a GPU A/B (async vs
+  `SYNC_READ=1`) to confirm the R3 latency win.
+- **Marker accumulation** (increment 2) unchanged: discovered-but-never-loaded
+  markers persist.
+- **DSA host staging not eliminated** (increment 2.5) unchanged: async still allocs
+  transient sidecar host staging per load (freed at finalize); the gate-#1 device
+  budget bounds concurrency.
+- **Synchronous DSA sidecar H2D at promotion** (scheduler thread) — small indexer
+  only, but still a `load_stream.synchronize()` per promoted DSA req.
+- **Fence timing**: if a promoted req is not scheduled the round it promotes (batch
+  full), its `enqueue_device_load` op is fenced by a later `start_loading` — the
+  same property the increment-2 sync path already had; nodes stay pinned meanwhile.

@@ -106,12 +106,17 @@ class TestDevicePageMeta(unittest.TestCase):
         with self.assertRaises(AssertionError):
             dpm.get_device_page_buffer_meta(pool, list(range(0, 63)))  # not a page
 
-    def test_supported_and_dsa_declined(self):
+    def test_supported_including_dsa_main_latent(self):
+        # Increment 2.5 lifted the increment-1 use_dsa veto: a DSA pool's MAIN latent
+        # (kv_buffer + kv_cache_dim) is a real layer-first MLA buffer and IS
+        # expressible device-direct here; the indexer sidecar is the hybrid
+        # controller's concern, not this module's. So supported() is True for MLA,
+        # MHA, AND a DSA (use_dsa) MLA-shaped pool.
         self.assertTrue(dpm.supported(FakeMlaPool()))
         self.assertTrue(dpm.supported(FakeMhaPool()))
         dsa = FakeMlaPool()
-        dsa.use_dsa = True  # DSA anchor pool -> stock host path
-        self.assertFalse(dpm.supported(dsa))
+        dsa.use_dsa = True
+        self.assertTrue(dpm.supported(dsa))
 
     def test_device_pool_regions(self):
         pool = FakeMlaPool(layer_num=4, size=256, page_size=64, kv_cache_dim=576,
