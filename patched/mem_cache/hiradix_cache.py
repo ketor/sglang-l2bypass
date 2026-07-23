@@ -597,9 +597,9 @@ class HiRadixCache(RadixCache):
             for ack_id, node in list(self.ongoing_backup.items()):
                 try:
                     if self.l2_bypass:
-                        # Bypass pins the GPU slot via lock_ref (not host_ref).
+                        # Bypass pins the GPU slot via lock_ref (not host_ref). Task 4:
+                        # the DSA sidecar is device-direct (no host staging to free).
                         self.dec_lock_ref(node)
-                        self._release_bypass_sidecar_host(node)
                     else:
                         node.release_host()
                 except Exception:
@@ -670,10 +670,8 @@ class HiRadixCache(RadixCache):
                         # Deferred device-slot unlock: the device->L3 PUT has acked,
                         # so the GPU slot is no longer an in-flight RDMA source and
                         # may be evicted. (Pinned at write_backup via inc_lock_ref.)
+                        # Task 4: the DSA sidecar is device-direct (no host staging).
                         self.dec_lock_ref(entry)
-                        # Free the transient DSA indexer host staging slots (D2H'd at
-                        # write-through, consumed by batch_set_v2_device).
-                        self._release_bypass_sidecar_host(entry)
                     else:
                         entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
@@ -881,19 +879,6 @@ class HiRadixCache(RadixCache):
         resident). Distinct from l3_backed (which means THIS instance wrote it)."""
         return getattr(node, "l3_present", False)
 
-    def _release_bypass_sidecar_host(self, node: TreeNode) -> None:
-        """Free the DSA indexer sidecar's transient host staging slots once the
-        device-direct storage backup has acked. No-op for dense bypass (no sidecar)
-        or a node whose backup carried no sidecar. Idempotent (clears the attr)."""
-        side_h = getattr(node, "bypass_backup_sidecar_host", None)
-        if side_h is None:
-            return
-        node.bypass_backup_sidecar_host = None
-        try:
-            self.cache_controller.mem_pool_host.free(side_h)
-        except Exception:
-            logger.exception("Failed to free bypass sidecar host slots for node %d", node.id)
-
     def _node_l3_resident(self, node: TreeNode) -> bool:
         """True if node's KV is retrievable from L3 by hash — either this instance
         wrote it (l3_backed) or it was discovered via exist (l3_present). Both are
@@ -949,29 +934,13 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        # DSA/hybrid: the main MLA latent is device-direct, but the small DSA indexer
-        # sidecar rides the host v2 path — allocate its host slots now (D2H'd in the
-        # controller's start_writing, freed after the storage backup acks). The
-        # indexer reuses the KV page indices, so one alloc sized to this node covers
-        # it. Dense (non-hybrid) bypass has no sidecar.
-        if self._get_extra_pools():
-            side_h = self.cache_controller.mem_pool_host.alloc(len(node.value))
-            if side_h is None:
-                self.evict_host(len(node.value))
-                side_h = self.cache_controller.mem_pool_host.alloc(len(node.value))
-            if side_h is None:
-                return 0
-            node.bypass_sidecar_host = side_h
-            self.cache_controller.write_device(
-                device_indices=node.value,
-                node_id=node.id,
-                sidecar_host_indices=side_h,
-            )
-        else:
-            # Enqueue the device-only write op (records the ack event; no D2H copy).
-            self.cache_controller.write_device(
-                device_indices=node.value, node_id=node.id
-            )
+        # Task 4: DSA/hybrid AND dense are now identical — the main MLA latent AND
+        # (for DSA) the indexer sidecar both go device-direct, riding the same GPU
+        # slots. No host staging is allocated for either. Enqueue the device-only
+        # write op (records the ack event; no D2H copy).
+        self.cache_controller.write_device(
+            device_indices=node.value, node_id=node.id
+        )
         # Mark L3-backed at enqueue time, mirroring stock (backuped flips when
         # host_value is set in write_backup, before the storage backup completes).
         node.l3_backed = True
@@ -1066,22 +1035,15 @@ class HiRadixCache(RadixCache):
         """L2-bypass storage backup: hand DEVICE slot indices (not host_value) to
         the backend. The GPU slot stays pinned (lock_ref) until this op acks, when
         _drain_backup releases it. Snapshot the indices to CPU so the backup thread
-        needs no GPU sync."""
-        hybrid = bool(self._get_extra_pools())
+        needs no GPU sync. Task 4: the DSA indexer sidecar is device-direct and rides
+        these same slots (the backend derives it from _sidecar_entries()), so there is
+        no sidecar host staging to hand over."""
         if backup_len is None or len(node.key) == backup_len:
             top, key, hash_value = node, node.key, node.hash_value
             device_value = node.value.detach().to("cpu")
-            side_h = getattr(node, "bypass_sidecar_host", None) if hybrid else None
         else:
             chain, top, key, hash_value = self._walk_split_chain(node, backup_len)
             device_value = torch.cat([n.value for n in chain]).detach().to("cpu")
-            if hybrid:
-                parts = [getattr(n, "bypass_sidecar_host", None) for n in chain]
-                side_h = (
-                    torch.cat(parts) if all(p is not None for p in parts) else None
-                )
-            else:
-                side_h = None
 
         prefix_keys = (
             top.get_prefix_hash_values(top.parent)
@@ -1089,25 +1051,8 @@ class HiRadixCache(RadixCache):
             else None
         )
 
-        # DSA/hybrid: hand the already-D2H'd sidecar host slots to the backend, which
-        # writes the main KV device-direct AND the indexer from host in one
-        # batch_set_v2_device. The concatenated host slots are freed at _drain_backup.
-        extra = {}
-        if hybrid and side_h is not None:
-            extra = {
-                "extra_pools": [
-                    PoolTransfer(
-                        name=tmpl.name,
-                        host_indices=side_h,
-                        hit_policy=tmpl.hit_policy,
-                    )
-                    for tmpl in self._get_extra_pools().get("extra_pools", [])
-                ]
-            }
-            node.bypass_backup_sidecar_host = side_h
-
         operation_id = self.cache_controller.write_storage_device(
-            device_value, key, hash_value, prefix_keys, **extra
+            device_value, key, hash_value, prefix_keys
         )
         # Track by op id for the deferred device-slot unlock at _drain_backup.
         # No protect_host(): the slot is pinned by lock_ref, not host_ref.
@@ -2574,16 +2519,9 @@ class HiRadixCache(RadixCache):
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
-        # DSA/hybrid bypass: the sidecar host staging slots track the KV slots 1:1,
-        # so split them alongside value (present only in the write-through -> backup
-        # window, where the node is pinned and not evicted).
-        if (
-            self.l2_bypass
-            and not child.evicted
-            and getattr(child, "bypass_sidecar_host", None) is not None
-        ):
-            new_node.bypass_sidecar_host = child.bypass_sidecar_host[:split_len].clone()
-            child.bypass_sidecar_host = child.bypass_sidecar_host[split_len:].clone()
+        # Task 4: the DSA indexer sidecar is device-direct (rides the KV device slots),
+        # so there is no sidecar host staging to split alongside value — the split of
+        # node.value below covers the sidecar's slots implicitly.
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size

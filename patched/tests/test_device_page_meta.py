@@ -69,6 +69,78 @@ class FakeMhaPool:
         ]
 
 
+class FakeIndexerTensor:
+    """Stand-in for a layer-first, page-indexed indexer buffer (page_num, page_bytes),
+    exposing shape/stride(0) alongside data_ptr/numel/element_size."""
+
+    def __init__(self, base, page_num, page_bytes, itemsize=1):
+        self._base = base
+        self._page_num = page_num
+        self._page_bytes = page_bytes
+        self._itemsize = itemsize
+
+    def data_ptr(self):
+        return self._base
+
+    def numel(self):
+        return self._page_num * self._page_bytes
+
+    def element_size(self):
+        return self._itemsize
+
+    @property
+    def shape(self):
+        return (self._page_num, self._page_bytes)
+
+    def stride(self, dim=None):
+        strides = (self._page_bytes, 1)  # contiguous (page_num, page_bytes)
+        return strides if dim is None else strides[dim]
+
+
+class FakeIndexerPool:
+    """DSA indexer device pool: index_k_with_scale_buffer[L] is (page_num, page_bytes)."""
+
+    def __init__(self, layer_num=4, page_num=8, page_size=64, page_bytes=132):
+        self.page_size = page_size
+        self.index_k_with_scale_buffer = [
+            FakeIndexerTensor(0x200000 * (L + 1), page_num, page_bytes)
+            for L in range(layer_num)
+        ]
+
+
+class TestDeviceSidecarPageMeta(unittest.TestCase):
+    def test_sidecar_supported(self):
+        self.assertTrue(dpm.sidecar_supported(FakeIndexerPool()))
+        # A plain MLA/MHA main pool has no indexer buffer -> not a sidecar pool.
+        self.assertFalse(dpm.sidecar_supported(FakeMlaPool()))
+
+    def test_sidecar_page_indexed_layer_segments(self):
+        pool = FakeIndexerPool(layer_num=4, page_num=8, page_size=64, page_bytes=132)
+        # Two pages at slots 0 (row 0) and 128 (row 2 = 128 // 64).
+        indices = list(range(0, 64)) + list(range(128, 192))
+        seg_ptrs, seg_sizes = dpm.get_device_sidecar_page_buffer_meta(pool, indices)
+        self.assertEqual(len(seg_ptrs), 2)  # sub=1, page-indexed
+        for p, page_row in enumerate((0, 2)):
+            self.assertEqual(len(seg_ptrs[p]), 4)      # one segment per layer
+            self.assertEqual(seg_sizes[p], [132] * 4)  # one page-row payload/layer
+            for L in range(4):
+                base = 0x200000 * (L + 1)
+                self.assertEqual(seg_ptrs[p][L], base + page_row * 132)
+
+    def test_sidecar_page_alignment_assert(self):
+        with self.assertRaises(AssertionError):
+            dpm.get_device_sidecar_page_buffer_meta(
+                FakeIndexerPool(page_size=64), list(range(0, 63)))
+
+    def test_sidecar_device_pool_regions(self):
+        pool = FakeIndexerPool(layer_num=3, page_num=8, page_bytes=132)
+        regions = dpm.sidecar_device_pool_regions(pool)
+        self.assertEqual(len(regions), 3)
+        for L, (base, size) in enumerate(regions):
+            self.assertEqual(base, 0x200000 * (L + 1))
+            self.assertEqual(size, 8 * 132)
+
+
 class TestDevicePageMeta(unittest.TestCase):
     def test_mla_single_object_per_page(self):
         pool = FakeMlaPool(layer_num=4, page_size=64, kv_cache_dim=576, itemsize=2)

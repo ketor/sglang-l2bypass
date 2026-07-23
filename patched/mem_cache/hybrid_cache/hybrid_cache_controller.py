@@ -258,8 +258,9 @@ class HybridCacheController(BaseHiCacheController):
         """Hybrid gate: on top of the base requirements (flag, supports_device_
         transfer, zero-copy v1 write surface for the main KV, per-pool device meta,
         register_mem_pool_device), DSA bypass ALSO needs the backend's v2-device
-        split-value ABI and the anchor+INDEXER pool shape. Any miss -> stock host
-        path with a clear warning."""
+        split-value ABI, the anchor+INDEXER pool shape, and — task 4 — a backend that
+        can register the sidecar device pool plus a sidecar whose device buffer is
+        device-SG expressible. Any miss -> stock host path with a clear warning."""
         self.l2_bypass = False
         if not self.l2_bypass_requested:
             return
@@ -282,17 +283,57 @@ class HybridCacheController(BaseHiCacheController):
                 [str(e.name) for e in self._sidecar_entries()],
             )
             return
-        # Base gate does the rest (device meta, register_mem_pool_device, flip
-        # l2_bypass + page_set_func). The hybrid _page_backup overrides the write
-        # dispatch, so page_set_func is unused here, but keep the base contract.
-        super()._maybe_enable_l2_bypass()
-        if self.l2_bypass:
-            logger.info(
-                "HiCache DSA L2-bypass ENABLED: main MLA latent RDMAs straight "
-                "from/to GPU slots (device-direct SG); the DSA indexer sidecar "
-                "rides the host v2 path. Backend=%r.",
+        # Task 4: the sidecar goes device-direct (no host staging), so the backend
+        # must accept a sidecar device-pool registration and every sidecar's GPU
+        # buffer must be device-SG expressible (layer-first index_k_with_scale_buffer).
+        from sglang.srt.mem_cache import device_page_meta
+
+        if not callable(
+            getattr(self.storage_backend, "register_mem_pool_device_sidecar", None)
+        ):
+            logger.warning(
+                "SGLANG_HICACHE_L2_BYPASS=1 but backend %r lacks "
+                "register_mem_pool_device_sidecar (device-direct sidecar); DSA "
+                "bypass off, using the stock host path.",
                 self.storage_backend_type,
             )
+            return
+        if not all(
+            device_page_meta.sidecar_supported(e.device_pool)
+            for e in self._sidecar_entries()
+        ):
+            logger.warning(
+                "SGLANG_HICACHE_L2_BYPASS=1 but a DSA sidecar device pool is not "
+                "device-SG expressible (index_k_with_scale_buffer); DSA bypass off, "
+                "using the stock host path.",
+            )
+            return
+        # Base gate does the rest (main-pool device meta, register_mem_pool_device,
+        # flip l2_bypass + page_set_func). The hybrid _page_backup overrides the write
+        # dispatch, so page_set_func is unused here, but keep the base contract.
+        super()._maybe_enable_l2_bypass()
+        if not self.l2_bypass:
+            return
+        # Register each sidecar's device pool for GPUDirect RDMA. Failure rolls back
+        # to the stock host path (honest: no silent half-device sidecar).
+        try:
+            for e in self._sidecar_entries():
+                self.storage_backend.register_mem_pool_device_sidecar(
+                    e.name, e.device_pool
+                )
+        except Exception:
+            logger.exception(
+                "Failed to register a DSA sidecar device pool; DSA bypass off, using "
+                "the stock host path."
+            )
+            self.l2_bypass = False
+            return
+        logger.info(
+            "HiCache DSA L2-bypass ENABLED: main MLA latent AND the DSA indexer "
+            "sidecar both RDMA straight from/to GPU slots (device-direct SG); no host "
+            "staging. Backend=%r.",
+            self.storage_backend_type,
+        )
 
     @staticmethod
     def parse_storage_backend_extra_config(
@@ -460,38 +501,15 @@ class HybridCacheController(BaseHiCacheController):
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
-        sidecar_host_indices: Optional[torch.Tensor] = None,
     ) -> int:
-        """DSA L2-bypass write-through: the main MLA latent stays in its GPU slots
-        (pinned; RDMA'd device-direct at storage backup). The DSA indexer sidecar is
-        D2H'd to the caller-allocated host slots (sidecar_host_indices) in
-        start_writing, exactly as the stock hybrid path does — the small sidecar
-        keeps the proven host v2 path. The sidecar transfer reuses the main-KV
-        device slots (indices_from_pool=KV: the indexer lives at the same token
-        slots). No host slot for the main KV. Returns node_id (always succeeds; the
-        sidecar host alloc happened in the caller)."""
-        sidecars = (
-            [
-                PoolTransfer(
-                    name=e.name,
-                    host_indices=sidecar_host_indices,
-                    device_indices=device_indices,
-                    hit_policy=PoolHitPolicy.ALL_PAGES,
-                )
-                for e in self._sidecar_entries()
-            ]
-            if sidecar_host_indices is not None
-            else None
-        )
+        """DSA L2-bypass write-through (task 4): BOTH the main MLA latent AND the DSA
+        indexer sidecar stay in their GPU slots (pinned; RDMA'd device-direct at
+        storage backup). No host slot, no D2H for either — the indexer rides the same
+        KV device slots, so the backup derives its device meta from device_indices.
+        Returns node_id (always succeeds; there is no host allocation to fail)."""
         host_placeholder = device_indices.new_empty(0)
         self.write_queue.append(
-            CacheOperation(
-                host_placeholder,
-                device_indices,
-                node_id,
-                priority,
-                pool_transfers=sidecars or None,
-            )
+            CacheOperation(host_placeholder, device_indices, node_id, priority)
         )
         self.start_writing()
         return node_id
@@ -505,9 +523,10 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
         """DSA L2-bypass storage backup: the operation's host_indices field carries
-        the main-KV DEVICE slot indices (SG put from GPU); extra_pools carry the
-        already-D2H'd sidecar host slots for the host v2 write. _page_backup combines
-        both into one batch_set_v2_device call per batch."""
+        the main-KV DEVICE slot indices (SG put from GPU). Task 4: the indexer sidecar
+        is device-direct too and rides those same slots, so _page_backup_device
+        derives its DEVICE sidecar transfers from _sidecar_entries() and does not need
+        extra_pools (kept for signature compatibility; unused under bypass)."""
         operation = StorageOperation(
             device_indices,
             token_ids,
@@ -523,39 +542,19 @@ class HybridCacheController(BaseHiCacheController):
             return
 
         if self.l2_bypass:
-            # DSA device-direct: NO main-KV D2H (it RDMAs from GPU slots at backup).
-            # Only the small DSA indexer sidecar is D2H'd to host here, so the stock
-            # v2 write can read it. Anchor indices are empty (skips the anchor
-            # backup inside HostPoolGroup.backup_from_device_all_layer); the sidecar
-            # transfers carry their own host+device indices.
+            # DSA device-direct (task 4): NO D2H at all — the main MLA latent AND the
+            # DSA indexer sidecar both RDMA from their GPU slots at storage backup.
+            # Record empty start/finish events so the existing writing_check ->
+            # _finish_write_through_ack machinery still fires (triggering the
+            # device->L3 backup and the deferred device-slot unlock). Identical to the
+            # dense base bypass branch; the GPU slots stay pinned by the caller's
+            # inc_lock_ref until the backup ack.
             op = CacheOperation.merge_ops(self.write_queue)
-            _, _, resolved_pool_transfers = self.move_hybrid_indices(op)
             self.write_queue.clear()
-            empty = op.device_indices.new_empty(0)
             start_event = device_module.Event()
             finish_event = device_module.Event()
             start_event.record()
-            with device_module.stream(self.write_stream):
-                start_event.wait(self.write_stream)
-                # Sidecar-only D2H (drive the sidecar entries directly; the anchor
-                # main KV is NOT copied to host — it RDMAs device-direct at backup).
-                for transfer in resolved_pool_transfers or []:
-                    entry = self.mem_pool_host.entry_map.get(transfer.name)
-                    if entry is None or transfer.host_indices is None:
-                        continue
-                    entry.host_pool.backup_from_device_all_layer(
-                        entry.device_pool,
-                        transfer.host_indices,
-                        transfer.device_indices,
-                        self.io_backend,
-                    )
-                finish_event.record()
-                self._record_transfer_indices_on_stream(
-                    self.write_stream,
-                    empty,
-                    op.device_indices,
-                    resolved_pool_transfers,
-                )
+            finish_event.record()
             self.ack_write_queue.append(
                 HiCacheAck(start_event, finish_event, op.node_ids)
             )
@@ -650,106 +649,40 @@ class HybridCacheController(BaseHiCacheController):
     def load_device_direct(
         self, hash_values: List[str], node_id: int = -1
     ) -> tuple[Optional[torch.Tensor], int]:
-        """DSA L2-bypass on-demand load: allocate GPU KV slots for the marker span,
-        RDMA the main MLA latent straight into them AND read the DSA indexer sidecar
-        into a transient host staging buffer (one batch_get_v2_device call), then
-        H2D the sidecar into its device index buffer at the SAME GPU slots. On
-        return the GPU slots hold both the latent (SG GET) and the indexer (H2D).
+        """DSA L2-bypass on-demand load (task 4): allocate GPU KV slots for the marker
+        span, then one batch_get_v2_device RDMAs the main MLA latent AND the DSA
+        indexer sidecar straight INTO those GPU slots (the indexer rides the same
+        slots; DEVICE sidecar transfer, host_indices None). No host staging, no H2D —
+        on return the GPU slots hold both components.
 
         Returns (device_indices, ok_pages) like the dense variant: ok_pages is the
         consecutive prefix where BOTH the main KV and every sidecar page hit (the
         first miss truncates). (None, 0) if the device allocation failed."""
         npages = len(hash_values)
         total_tokens = npages * self.page_size
-        full_allocator = getattr(
-            self.mem_pool_device_allocator,
-            "full_attn_allocator",
-            self.mem_pool_device_allocator,
-        )
+        full_allocator = self._full_allocator()
         device_indices = full_allocator.alloc(total_tokens)
         if device_indices is None:
-            return None, 0
-        # Transient host staging for the sidecar (freed after H2D). The indexer
-        # rides the KV page indices, so the sidecar device slots == the main-KV
-        # device slots just allocated.
-        side_host = self.mem_pool_host.alloc(total_tokens)
-        if side_host is None:
-            full_allocator.free(device_indices)
             return None, 0
         sidecars = [
             PoolTransfer(
                 name=e.name,
-                host_indices=side_host,
                 device_indices=device_indices,
+                host_indices=None,
                 keys=list(hash_values),
                 hit_policy=PoolHitPolicy.ALL_PAGES,
             )
             for e in self._sidecar_entries()
         ]
-        try:
-            results = self.storage_backend.batch_get_v2_device(
-                hash_values, device_indices, sidecars
-            )
-            kv_ok = results.get("kv") or []
-            # A page is usable only if the main KV AND every sidecar hit it.
-            ok_pages = 0
-            for p in range(npages):
-                if p >= len(kv_ok) or not kv_ok[p]:
-                    break
-                if not all(
-                    (results.get(str(e.name)) or [False] * npages)[p]
-                    for e in self._sidecar_entries()
-                ):
-                    break
-                ok_pages += 1
-            if ok_pages > 0:
-                # H2D the verified sidecar prefix into the device index buffer at the
-                # main-KV slots, then it is device-resident (staging freed below).
-                self._sidecar_h2d(side_host, device_indices, sidecars, ok_pages)
-        finally:
-            # The staging host slots have served their purpose (sidecar now on
-            # device for the hit prefix); the main KV never touched host.
-            self.mem_pool_host.free(side_host)
-        return device_indices, ok_pages
-
-    def _sidecar_h2d(
-        self,
-        side_host: torch.Tensor,
-        device_indices: torch.Tensor,
-        sidecars: list[PoolTransfer],
-        ok_pages: int,
-    ) -> None:
-        """H2D the sidecar's verified prefix from the host staging slots into its
-        device index buffer (at the main-KV device slots). Runs on the load stream
-        and synchronizes before returning, so the staging host slots can be freed
-        and the index is present for the compute fence recorded in start_loading."""
-        n_tokens = ok_pages * self.page_size
-        prefix_op = CacheOperation(
-            device_indices[:0],  # empty anchor host -> anchor H2D skipped
-            device_indices[:0],  # empty anchor device
-            -1,
-            pool_transfers=[
-                PoolTransfer(
-                    name=tr.name,
-                    host_indices=tr.host_indices[:n_tokens],
-                    device_indices=tr.device_indices[:n_tokens],
-                    hit_policy=tr.hit_policy,
-                )
-                for tr in sidecars
-            ],
+        results = self.storage_backend.batch_get_v2_device(
+            hash_values, device_indices, sidecars
         )
-        host_moved, device_moved, resolved = self.move_hybrid_indices(prefix_op)
-        with device_module.stream(self.load_stream):
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_moved,
-                    device_moved,
-                    i,
-                    self.io_backend,
-                    pool_transfers=resolved,
-                )
-        self.load_stream.synchronize()
+        kv_ok = results.get("kv") or []
+        sidecar_oks = [
+            results.get(str(e.name)) or [] for e in self._sidecar_entries()
+        ]
+        ok_pages = consecutive_ok_pages(kv_ok, sidecar_oks, npages)
+        return device_indices, ok_pages
 
     def enqueue_device_load(
         self, device_indices: torch.Tensor, node_ids: List[int]
@@ -765,13 +698,12 @@ class HybridCacheController(BaseHiCacheController):
 
     # ---- Increment 3: async device-direct read (DSA overrides) -----------------
     #
-    # Split the synchronous load_device_direct across the thread boundary exactly
-    # like the dense base, but the DSA read is a split value: the background thread
-    # RDMAs the main MLA latent into the GPU slots AND reads the indexer sidecar
-    # into a transient HOST staging span (batch_get_v2_device — pure C/RDMA + host
-    # memcpy, no CUDA). The sidecar H2D (a CUDA op) is deferred to the scheduler
-    # thread in finalize_device_load, keeping all CUDA + collectives off the
-    # background thread.
+    # Split load_device_direct across the thread boundary like the dense base. Task 4:
+    # the DSA read is a device-only split value now — the background thread RDMAs the
+    # main MLA latent AND the indexer sidecar straight into the GPU slots (one
+    # batch_get_v2_device with DEVICE sidecar transfers: pure C/RDMA, no CUDA). There
+    # is no sidecar host staging and no H2D, so finalize_device_load is a no-op
+    # (inherited from the base) and the background thread stays fully CUDA-free.
 
     def _full_allocator(self):
         return getattr(
@@ -783,37 +715,32 @@ class HybridCacheController(BaseHiCacheController):
     def make_device_load_task(
         self, hash_values: List[str]
     ) -> Optional[DeviceLoadTask]:
-        """Alloc GPU main-KV slots + transient sidecar host staging + build the
-        sidecar PoolTransfers (scheduler thread). None if either alloc fails (the
-        caller evicts + retries). No GET, no CUDA."""
+        """Alloc GPU main-KV slots + build the DEVICE sidecar PoolTransfers (scheduler
+        thread). None if the alloc fails (the caller evicts + retries). No GET, no
+        CUDA, no host staging (task 4: the indexer rides the same GPU slots)."""
         total_tokens = len(hash_values) * self.page_size
         full_allocator = self._full_allocator()
         device_indices = full_allocator.alloc(total_tokens)
         if device_indices is None:
             return None
-        side_host = self.mem_pool_host.alloc(total_tokens)
-        if side_host is None:
-            full_allocator.free(device_indices)
-            return None
         sidecars = [
             PoolTransfer(
                 name=e.name,
-                host_indices=side_host,
                 device_indices=device_indices,
+                host_indices=None,
                 keys=list(hash_values),
                 hit_policy=PoolHitPolicy.ALL_PAGES,
             )
             for e in self._sidecar_entries()
         ]
         return DeviceLoadTask(
-            hash_values, device_indices, sidecars=sidecars, side_host=side_host
+            hash_values, device_indices, sidecars=sidecars, side_host=None
         )
 
     def _run_device_get(self, task: DeviceLoadTask) -> int:
-        """Background thread: batch_get_v2_device fills the main KV via RDMA (device
-        slots) AND the indexer into task.side_host (host staging). Count the prefix
-        where the main KV AND every sidecar page hit. NO H2D here (deferred to
-        finalize on the scheduler thread)."""
+        """Background thread: one batch_get_v2_device RDMAs the main KV AND the DSA
+        indexer sidecar straight into the GPU slots (DEVICE sidecar transfers). Count
+        the prefix where the main KV AND every sidecar page hit. No CUDA, no H2D."""
         results = self.storage_backend.batch_get_v2_device(
             task.hash_values, task.device_indices, task.sidecars
         )
@@ -821,29 +748,19 @@ class HybridCacheController(BaseHiCacheController):
         sidecar_oks = [
             results.get(str(e.name)) or [] for e in self._sidecar_entries()
         ]
+        # Task 6: best-effort device-direct draft GET into the draft GPU slots.
+        self._maybe_device_draft_get(task)
         return consecutive_ok_pages(kv_ok, sidecar_oks, len(task.hash_values))
 
-    def finalize_device_load(self, task: DeviceLoadTask, ok_pages: int) -> None:
-        """Scheduler thread, at promotion: H2D the verified sidecar prefix from the
-        host staging into its device index buffer (at the main-KV slots), then free
-        the staging. After this the GPU slots hold both latent and indexer."""
-        if ok_pages > 0 and task.side_host is not None:
-            self._sidecar_h2d(
-                task.side_host, task.device_indices, task.sidecars, ok_pages
-            )
-        if task.side_host is not None:
-            self.mem_pool_host.free(task.side_host)
-            task.side_host = None
+    # finalize_device_load: inherited from the base (no-op) — task 4 removed the
+    # sidecar H2D, so there is nothing to do on the scheduler thread at promotion.
 
     def free_device_load(self, task: DeviceLoadTask) -> None:
-        """Abort path (scheduler thread): free the main-KV GPU slots + the sidecar
-        host staging. Idempotent."""
+        """Abort path (scheduler thread): free the main-KV GPU slots (the indexer
+        rode the same slots — no separate sidecar staging to free). Idempotent."""
         if task.device_indices is not None:
             self._full_allocator().free(task.device_indices)
             task.device_indices = None
-        if task.side_host is not None:
-            self.mem_pool_host.free(task.side_host)
-            task.side_host = None
 
     def free_device_indices(self, device_indices: torch.Tensor) -> None:
         """Free a span of main-KV device slots via the full-attn allocator that owns
@@ -1065,12 +982,13 @@ class HybridCacheController(BaseHiCacheController):
         super()._page_backup(operation)
 
     def _page_backup_device(self, operation):
-        """DSA L2-bypass backup: one batch_set_v2_device call per batch writes the
-        main MLA latent device-direct (operation.host_indices carries the GPU slot
-        indices) AND the DSA indexer sidecar from its host slots (operation.pool_
-        transfers, already D2H'd in start_writing). Split value: main KV under the
-        @sg-chunked v1-style 'kv' keys, sidecar under its own '_indexer_k' keys —
-        two namespaces, no collision, isolated by model_hash."""
+        """DSA L2-bypass backup (task 4): one batch_set_v2_device call per batch writes
+        the main MLA latent AND the DSA indexer sidecar BOTH device-direct.
+        operation.host_indices carries the main-KV GPU slot indices; the indexer rides
+        the SAME slots (a DEVICE sidecar PoolTransfer with device_indices=batch_kv_
+        device, host_indices=None). Split value: main KV under the @sg-chunked v1-style
+        'kv' keys, sidecar under its own '_indexer_k@sg' keys — two namespaces, no
+        collision, isolated by model_hash."""
         prefix_keys = operation.prefix_keys
         page_size = self.page_size
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1079,21 +997,16 @@ class HybridCacheController(BaseHiCacheController):
             batch_kv_device = operation.host_indices[
                 i * page_size : (i + n) * page_size
             ]
-            batch_sidecars = []
-            for tr in operation.pool_transfers or []:
-                bh = (
-                    tr.host_indices[i * page_size : (i + n) * page_size]
-                    if tr.host_indices is not None
-                    else None
+            batch_sidecars = [
+                PoolTransfer(
+                    name=e.name,
+                    device_indices=batch_kv_device,
+                    host_indices=None,
+                    keys=batch_hashes,
+                    hit_policy=PoolHitPolicy.ALL_PAGES,
                 )
-                batch_sidecars.append(
-                    PoolTransfer(
-                        name=tr.name,
-                        host_indices=bh,
-                        keys=batch_hashes,
-                        hit_policy=tr.hit_policy,
-                    )
-                )
+                for e in self._sidecar_entries()
+            ]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             results = self.storage_backend.batch_set_v2_device(
                 batch_hashes, batch_kv_device, batch_sidecars, extra_info
@@ -1104,6 +1017,11 @@ class HybridCacheController(BaseHiCacheController):
                     "DSA device-direct backup: %d main-KV pages failed.", n
                 )
                 break
+            # Task 6: best-effort device-direct draft L3 write alongside the target
+            # (the draft rides the same GPU slots). Inert unless a draft is registered
+            # and device-draft enabled.
+            if self.has_draft:
+                self._draft_device_set(batch_hashes, batch_kv_device)
             operation.pool_storage_result.update_extra_pool_hit_pages(
                 {k: v for k, v in results.items() if k != "kv"}
             )

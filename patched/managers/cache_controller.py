@@ -321,6 +321,11 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        # Task 6: EAGLE draft KV device-direct L3 under L2-bypass. Turned on at
+        # attach only if the backend exposes the device-draft ABI AND the draft GPU
+        # pool is a plain MLA/MHA (device-SG expressible, non-DSA). Off => draft L3
+        # stays disabled under bypass (honest degrade, as increments 1-3).
+        self.draft_device_enabled = False
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -575,6 +580,7 @@ class HiCacheController:
 
             self._maybe_enable_l2_bypass()
             self._maybe_register_draft_with_storage()
+            self._maybe_enable_device_draft()
 
             if self.l2_bypass:
                 # Increment 3 (gate #1 re-anchor): the stock speculative-prefetch
@@ -917,6 +923,15 @@ class HiCacheController:
         if device_indices is None:
             return None, 0
         results = self.storage_backend.batch_get_v1_device(hash_values, device_indices)
+        # Task 6: best-effort device-direct draft GET into the draft GPU slots (sync
+        # read mode; the async path does the equivalent in _run_device_get).
+        if self.has_draft and self.draft_device_enabled:
+            try:
+                self.storage_backend.batch_get_v1_device_draft(
+                    hash_values, device_indices)
+            except Exception:
+                logger.debug("Device-direct draft L3 read failed (best-effort).",
+                             exc_info=True)
         ok_pages = 0
         for ok in results:
             if not ok:
@@ -972,6 +987,9 @@ class HiCacheController:
         results = self.storage_backend.batch_get_v1_device(
             task.hash_values, task.device_indices
         )
+        # Task 6: best-effort device-direct draft GET into the draft GPU slots (same
+        # slots), also pure RDMA — background-safe. Does not gate the target verify.
+        self._maybe_device_draft_get(task)
         return consecutive_ok_pages(results, [], len(task.hash_values))
 
     def finalize_device_load(self, task: "DeviceLoadTask", ok_pages: int) -> None:
@@ -1134,6 +1152,9 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+        # Task 6: if bypass is already on, wire the device-direct draft L3 path too
+        # (attach may have run before the draft pool was registered).
+        self._maybe_enable_device_draft()
 
     def _maybe_enable_l2_bypass(self) -> None:
         """Turn on device-direct write only if requested AND the backend can RDMA
@@ -1237,6 +1258,83 @@ class HiCacheController:
         # Generic backends.
         self.draft_page_get_func = self._draft_page_get_generic
         self.draft_page_set_func = self._draft_page_set_generic
+
+    def _maybe_enable_device_draft(self) -> None:
+        """Task 6: turn on device-direct draft KV L3 under L2-bypass.
+
+        Under bypass there is no host D2H for the target, so the stock draft L3 path
+        (which reads/writes the draft HOST pool) has nothing to stage. Instead the
+        draft KV is RDMA'd straight from/into the draft GPU pool's slots (the same
+        slots the target rode). Enabled only if: bypass is on, a draft is registered,
+        the backend exposes the device-draft ABI (register_mem_pool_device_draft +
+        batch_set/get_v1_device_draft), AND the draft GPU pool is a plain MLA/MHA
+        expressible as device page meta. A DSA draft (indexer sidecar) is declined —
+        its sidecar is not handled here, and loading an incomplete draft KV would
+        just lower acceptance; we keep it honest by leaving draft L3 off. Best-effort:
+        any miss logs once and leaves draft L3 disabled (recompute-safe)."""
+        self.draft_device_enabled = False
+        if not (self.l2_bypass and self.has_draft and self.enable_storage):
+            return
+        backend = self.storage_backend
+        if not all(
+            callable(getattr(backend, m, None))
+            for m in ("register_mem_pool_device_draft",
+                      "batch_set_v1_device_draft", "batch_get_v1_device_draft")
+        ):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: backend %r lacks the "
+                "device-draft ABI.", self.storage_backend_type)
+            return
+        from sglang.srt.mem_cache import device_page_meta
+
+        if not device_page_meta.supported(self.mem_pool_device_draft) or getattr(
+            self.mem_pool_device_draft, "use_dsa", False
+        ):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: draft GPU pool %r is not "
+                "a plain device-SG-expressible MLA/MHA (DSA draft sidecar unhandled).",
+                type(self.mem_pool_device_draft).__name__)
+            return
+        try:
+            backend.register_mem_pool_device_draft(self.mem_pool_device_draft)
+        except Exception:
+            logger.exception(
+                "Failed to register draft GPU pool for device-direct draft L3; "
+                "leaving draft L3 off under bypass.")
+            return
+        self.draft_device_enabled = True
+        logger.info(
+            "HiCache draft L3 ENABLED under L2-bypass: draft KV RDMAs device-direct "
+            "(best-effort) alongside the target. Backend=%r.",
+            self.storage_backend_type)
+
+    def _draft_device_set(self, hash_values, device_indices) -> None:
+        """Best-effort device-direct draft L3 write (task 6). Mirrors _draft_page_set
+        but RDMAs from the draft GPU pool's slots (device_indices)."""
+        if not self.draft_device_enabled:
+            return
+        try:
+            self.storage_backend.batch_set_v1_device_draft(hash_values, device_indices)
+        except Exception:
+            logger.debug(
+                "Device-direct draft L3 write failed (best-effort), skipping.",
+                exc_info=True)
+
+    def _maybe_device_draft_get(self, task: "DeviceLoadTask") -> None:
+        """Best-effort device-direct draft L3 read (task 6), run on the background
+        device-load thread alongside the target GET (pure RDMA into the draft GPU
+        slots — no CUDA, no collective, so it is background-safe). Failure just means
+        the draft model recomputes those pages (EAGLE verifies against the target, so
+        a missing/partial draft only lowers acceptance, never correctness)."""
+        if not self.draft_device_enabled:
+            return
+        try:
+            self.storage_backend.batch_get_v1_device_draft(
+                task.hash_values, task.device_indices)
+        except Exception:
+            logger.debug(
+                "Device-direct draft L3 read failed (best-effort), skipping.",
+                exc_info=True)
 
     def prefetch(
         self,
@@ -1576,11 +1674,17 @@ class HiCacheController:
                 )
                 break
 
-            # Best-effort draft L3 write alongside target. Disabled under L2-bypass:
-            # the draft host pool holds no data (no D2H staging), and device-direct
-            # draft KV is out of scope for increment 1 (EAGLE draft-L3 stays off).
-            if self.has_draft and not self.l2_bypass:
-                self._draft_page_set(batch_hashes, batch_host_indices)
+            # Best-effort draft L3 write alongside target. Under L2-bypass the draft
+            # host pool holds no data (no D2H staging), so the draft rides the
+            # device-direct path (task 6): batch_host_indices carries the GPU slot
+            # indices in bypass. Off bypass, the stock host draft path is used. If
+            # device-draft could not be enabled (non-expressible/DSA draft pool),
+            # draft L3 simply stays off (recompute-safe).
+            if self.has_draft:
+                if self.l2_bypass:
+                    self._draft_device_set(batch_hashes, batch_host_indices)
+                else:
+                    self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

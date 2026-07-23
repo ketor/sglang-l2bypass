@@ -159,3 +159,83 @@ def device_pool_regions(pool) -> List[Tuple[int, int]]:
     for t in tensors:
         regions.append((int(t.data_ptr()), int(t.numel()) * int(t.element_size())))
     return regions
+
+
+# --- DSA indexer sidecar (device-direct), increment 2.5 -> task 4 -------------
+#
+# The DSA indexer sidecar (index_k_with_scale_buffer) is ALSO layer-first: a list
+# of ``layer_num`` per-layer 2D tensors (page_num, page_bytes), uint8. Unlike the
+# main MLA latent, which is TOKEN-indexed (row = slot), the indexer is PAGE-indexed
+# (row = slot // page_size holds the whole page's index+scale for that layer). So a
+# page's sidecar is ``layer_num`` per-layer segments, each one contiguous page-row —
+# the SAME scatter-gather shape as the main latent (layer_num segments per page), so
+# it needs the same @sg chunking on a narrow HCA. It is NOT single-segment. Task 4
+# gives it a GPUDirect MR (sidecar_device_pool_regions) so the indexer RDMAs
+# straight from/into its GPU buffer, eliminating the last host-staging residual of
+# increment 2.5.
+
+
+def _is_indexer(pool) -> bool:
+    layers = getattr(pool, "index_k_with_scale_buffer", None)
+    return (
+        isinstance(layers, (list, tuple))
+        and len(layers) > 0
+        and hasattr(pool, "page_size")
+    )
+
+
+def sidecar_supported(pool) -> bool:
+    """True if the DSA indexer sidecar's device pool can be expressed as layer-first
+    page-indexed scatter-gather segments (index_k_with_scale_buffer present). A
+    sidecar shape this module cannot express keeps the stock host v2 path (the
+    hybrid controller declines DSA bypass rather than silently drop the sidecar)."""
+    return _is_indexer(pool)
+
+
+def sidecar_device_pool_regions(pool) -> List[Tuple[int, int]]:
+    """(base, nbytes) of every per-layer DSA indexer device buffer, for RDMA
+    registration (task 4: the sidecar gets its own GPUDirect MR)."""
+    regions: List[Tuple[int, int]] = []
+    for t in getattr(pool, "index_k_with_scale_buffer", None) or []:
+        regions.append((int(t.data_ptr()), int(t.numel()) * int(t.element_size())))
+    return regions
+
+
+def get_device_sidecar_page_buffer_meta(
+    pool, indices
+) -> Tuple[List[List[int]], List[List[int]]]:
+    """Scatter-gather device page meta for the DSA indexer sidecar, parallel in
+    shape to get_device_page_buffer_meta but PAGE-indexed and single-object per page
+    (sub=1). Given the SAME token indices as the main KV (the indexer rides the KV
+    page slots), each page becomes one per-layer segment list: layer L contributes
+    the contiguous page-row (slot // page_size) of its buffer.
+
+    Returns (seg_ptrs, seg_sizes), each a list of length ``n_pages`` whose element
+    ``[p]`` is page ``p``'s per-layer segment list. The concatenation is LAYER-major
+    (layer0[page], layer1[page], ...), matching the main-latent write/read ordering,
+    so a page written device-direct reads back byte-identical (proven by the dfkv
+    sidecar-device roundtrip test)."""
+    page_size = pool.page_size
+    idx = indices.tolist() if hasattr(indices, "tolist") else list(indices)
+    assert len(idx) % page_size == 0, (
+        f"sidecar device page meta needs page-aligned indices, got {len(idx)} "
+        f"(page_size={page_size})"
+    )
+    n_pages = len(idx) // page_size
+
+    layers = pool.index_k_with_scale_buffer
+    itemsize = layers[0].element_size()
+    # One page-row's payload bytes and its row-to-row stride (equal for a
+    # contiguous (page_num, page_bytes) buffer; use stride to stay exact).
+    row_bytes = int(layers[0].shape[1]) * itemsize
+    row_stride = int(layers[0].stride(0)) * itemsize
+    bases = [int(t.data_ptr()) for t in layers]
+
+    seg_ptrs: List[List[int]] = []
+    seg_sizes: List[List[int]] = []
+    for p in range(n_pages):
+        slot = idx[p * page_size]
+        off = (slot // page_size) * row_stride
+        seg_ptrs.append([b + off for b in bases])
+        seg_sizes.append([row_bytes] * len(bases))
+    return seg_ptrs, seg_sizes

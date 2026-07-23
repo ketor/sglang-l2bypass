@@ -627,3 +627,167 @@ DSA main-latent IS supported (increment 2.5 lifted the veto).
 - **Fence timing**: if a promoted req is not scheduled the round it promotes (batch
   full), its `enqueue_device_load` op is fenced by a later `start_loading` — the
   same property the increment-2 sync path already had; nodes stay pinned meanwhile.
+
+---
+
+# Increment 4 — DSA indexer sidecar device-direct (task 4) + EAGLE draft L3 (task 6)
+
+Two changes on top of increments 1/2/2.5/3, both still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1` (with it off, byte-identical to stock). **No new
+bind-mount files** — every change lives in the already-mounted `device_page_meta.py`
+/ `hicache_storage.py` / `hiradix_cache.py` / `hybrid_cache/hybrid_cache_controller.py`
+/ `managers/cache_controller.py`, plus the existing dfkv backend mount.
+
+## Task 4 — DSA indexer sidecar device-direct (eliminates the host-pool residual)
+
+Increment 2.5 left the DSA indexer sidecar (`index_k_with_scale_buffer`) on the host
+v2 path: written via a D2H into anchor host staging, read into transient host staging
+then H2D'd. That anchor host allocation was the last host-pool承重 in DSA bypass.
+Increment 4 makes the sidecar device-direct too — it gets its own GPUDirect MR and
+RDMAs straight from/into its GPU index buffer, so DSA bypass allocates **zero** host
+slots on every operational path.
+
+**Sidecar geometry (important):** the indexer buffer is ALSO layer-first — a list of
+`layer_num` per-layer 2D `(page_num, page_bytes)` tensors — but PAGE-indexed (row
+`slot // page_size`), not token-indexed like the main latent. So a page's sidecar is
+`layer_num` per-layer segments (same SG shape as the main latent, NOT single-segment)
+and needs the SAME `@sg` chunking on a narrow HCA.
+
+### device_page_meta.py
+- `sidecar_supported(pool)` / `sidecar_device_pool_regions(pool)` /
+  `get_device_sidecar_page_buffer_meta(pool, indices)` (NEW) — the layer-first,
+  page-indexed device page meta + RDMA regions for the indexer, parallel to the
+  main-latent `get_device_page_buffer_meta` but page-row addressed, sub=1.
+
+### hicache_storage.py (base hooks, inert defaults)
+- `register_mem_pool_device_sidecar(name, device_pool)` → no-op; only the dfkv
+  backend overrides (GPUDirect MR for the indexer buffers).
+
+### managers/cache_controller.py (base)
+- no sidecar change (dense bypass has no sidecar); the DSA overrides are in the
+  hybrid controller.
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py
+- `_maybe_enable_l2_bypass` — added two gates: the backend must expose
+  `register_mem_pool_device_sidecar`, and every sidecar's device pool must be
+  `device_page_meta.sidecar_supported`; on success it registers each sidecar device
+  pool. Any miss → stock host path (honest: no half-device sidecar).
+- `write_device` — dropped `sidecar_host_indices`; the indexer rides the KV device
+  slots (device-direct at backup), so no host slot / D2H.
+- `start_writing` (bypass) — dropped the sidecar-only D2H; now records empty
+  start/finish events like the dense base bypass branch (NO D2H at all).
+- `_page_backup_device` — builds DEVICE sidecar PoolTransfers
+  (`device_indices=batch_kv_device`, `host_indices=None`) from `_sidecar_entries()`;
+  one `batch_set_v2_device` writes main KV + indexer both device-direct.
+- `load_device_direct` (sync) / `make_device_load_task` + `_run_device_get` (async) —
+  device sidecar transfers, no host staging; `_sidecar_h2d` **deleted**;
+  `finalize_device_load` override **removed** (inherits the base no-op — nothing to
+  H2D on the scheduler thread anymore); `free_device_load` no longer frees a
+  `side_host` (there is none).
+- `write_storage_device` — `extra_pools` is now unused under bypass (kept for
+  signature compat); the sidecar is derived from `_sidecar_entries()` in the backup.
+
+### mem_cache/hiradix_cache.py
+- `_write_backup_device` — hybrid and dense branches collapse to one: no sidecar host
+  alloc; just `write_device(device_indices=node.value)`.
+- `_write_backup_storage_device` — dropped the sidecar host concat / `extra_pools`
+  plumbing and `node.bypass_backup_sidecar_host`.
+- `_release_bypass_sidecar_host` **deleted**; removed its two call sites in
+  `_drain_backup` and `_force_release_pending_storage_ops` (no host staging to free).
+- `_split_node` — removed the `bypass_sidecar_host` split block (the sidecar rides
+  the KV slots, split implicitly with `node.value`).
+
+### dfkv backend `integration/hicache/dfkv_hicache.py` (branch feat/hicache-device-direct-put)
+- `_flatten_device` generalized with `keys_fn`/`sub` params (the sidecar + draft reuse
+  the identical `@sg` chunking under distinct namespaces).
+- `register_mem_pool_device_sidecar(name, device_pool)` — GPUDirect MR for the
+  indexer buffers (deduped against already-registered regions).
+- `_sidecar_device_set` / `_sidecar_device_get` — device SG put/get of the indexer
+  under `_pool_keys(name, hash)@sg{n}`, from `get_device_sidecar_page_buffer_meta`.
+- `batch_set_v2_device` / `batch_get_v2_device` — route a DEVICE sidecar transfer
+  (`_is_device_transfer`: device_indices set, host_indices None) through the device
+  path; a host sidecar transfer keeps the stock host v2 path. Metrics unchanged
+  (main = on_set/on_get; sidecar = on_set_v2/on_get_v2).
+- `batch_exists_v2` — probes `@sg0` for a device-registered sidecar (mirrors the main
+  KV exist probe), so discovery gates on the chunked indexer key.
+
+### extra_config geometry keys
+None added. The sidecar device geometry is derived from the pool
+(`index_k_with_scale_buffer` shape/stride); no new launch-config key.
+
+## Task 6 — EAGLE draft KV device-direct L3 (best-effort)
+
+Increments 1-3 disabled draft L3 under bypass (the draft host pool holds no data with
+no D2H staging). Task 6 restores it via the SAME device-direct mechanism as the main
+pool: draft KV RDMAs straight from/into the draft GPU pool's slots (the same slots the
+target rode) under a distinct `.draft` key namespace. Best-effort (try/except): a
+missing/partial draft only lowers EAGLE acceptance, never correctness (the target
+verifies the draft), so it never gates the target load.
+
+**Route decision:** device-direct, gated on `device_page_meta.supported(draft pool)
+AND not use_dsa`. A DSA draft (indexer sidecar) is DECLINED (honest degrade, logged):
+its sidecar is not handled for draft, and loading an incomplete draft KV is left off
+rather than silently partial. If the backend lacks the device-draft ABI, draft L3
+stays off.
+
+### managers/cache_controller.py (base — dense + used by hybrid)
+- `draft_device_enabled` (NEW state), `_maybe_enable_device_draft()` (NEW, called
+  from `attach_storage_backend` and `set_draft_kv_pool`), `_draft_device_set()` /
+  `_maybe_device_draft_get()` (NEW best-effort wrappers).
+- `_page_backup` — bypass branch writes the draft device-direct (`_draft_device_set`)
+  instead of the stock host draft path.
+- `_run_device_get` (async) + `load_device_direct` (sync) — best-effort device-direct
+  draft GET into the draft GPU slots (pure RDMA, background-safe).
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py
+- `_page_backup_device` — best-effort `_draft_device_set` after each main-KV batch.
+- `_run_device_get` — `_maybe_device_draft_get` alongside the target GET.
+
+### hicache_storage.py (base hooks, inert)
+- `register_mem_pool_device_draft` (no-op) / `batch_set_v1_device_draft` /
+  `batch_get_v1_device_draft` (NotImplementedError); only dfkv overrides.
+
+### dfkv backend
+- `register_mem_pool_device_draft` (GPUDirect MR for the draft pool),
+  `_draft_keys(hash, sub)` (`.draft` namespace, TP-aware: MLA draft sub=1 →
+  replicated, no tp suffix, rank-0-only write; MHA draft sub=2 → tp_size/tp_rank
+  suffix), `batch_set_v1_device_draft` / `batch_get_v1_device_draft`.
+
+## TP-consistency (unchanged invariant)
+No collective sequence changed. The sidecar device write/read are local RDMA (the
+write's MLA rank-skip matches the main latent + stock host v2 path; the read has no
+rank skip). `finalize_device_load` became a no-op — it never held a collective. The
+async read's balanced per-round done-MIN / alloc-MIN / pages-MIN (increment 3) are
+untouched. Draft GET runs on the background thread (pure RDMA, no collective).
+
+## Host-pool residual audit (task 4 goal: sidecar host承重 = 0 under bypass)
+`grep mem_pool_host.alloc/.free` over the bypass paths: the remaining references are
+all STOCK (non-bypass) code — `write()`, `load()`, the stock `start_writing` /
+`start_loading` branches (after the `if self.l2_bypass: return`), and the stock
+`prefetch_from_storage` branch (after the bypass `return`). `_sidecar_entries()` and
+`_init_extra_host_mem_release_queues` only READ `mem_pool_host.entries` metadata (pool
+names), not slots. So under bypass NO host slot is allocated for the main KV OR the
+sidecar; the host pools exist structurally but can be shrunk to a stub. This resolves
+the increment-2.5 known limitation ("Host-pool allocation NOT eliminated for DSA").
+
+## Tests
+- dfkv `test/python/test_dfkv_hicache_device_direct.py` (+4, `-k hicache` = 95 passed,
+  was 91): `test_dsa_split_value_device_sidecar_roundtrip` (real cache node: main KV +
+  indexer BOTH device-direct, byte-exact per layer), `test_device_sidecar_read_miss_
+  returns_false`, `test_draft_device_direct_roundtrip`, `test_draft_keys_distinct_and_
+  tp_aware`. (The full non-`-k hicache` suite has pre-existing cross-test subprocess-
+  server interference — the stock baseline fails the same set; unrelated to this work.)
+- SGLang `tests/test_device_page_meta.py` (+4): `TestDeviceSidecarPageMeta`
+  (page-indexed layer segments, alignment assert, regions, supported).
+- SGLang side otherwise py_compile + review only (no GPU on the dev box), as
+  increments 1-3.
+
+## Known limitations / deviations (increment 4)
+- **SGLang-side verified by py_compile + review + the dfkv-side byte-exact roundtrip**
+  (no GPU / GLM-5.2 in the dev box). The load-bearing correctness claim — the sidecar
+  layer-major device write/read reassemble byte-exact under distinct keys — IS proven
+  on the dfkv side against a real cache node.
+- **Draft L3 is best-effort.** A DSA draft pool is declined (device-only main latent,
+  sidecar unhandled for draft); requires a GPU EAGLE A/B to confirm the acceptance
+  benefit.
+- **Marker accumulation / gate-#1 device budget** (increments 2/3) unchanged.

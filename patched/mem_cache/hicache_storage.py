@@ -166,6 +166,39 @@ class HiCacheStorage(ABC):
         No-op on backends without device transfer."""
         self.mem_pool_device = mem_pool_device
 
+    def register_mem_pool_device_sidecar(self, name, device_pool):
+        """Task 4: register a DSA indexer sidecar's GPU buffers for RDMA (GPUDirect),
+        so the indexer transfers device-direct instead of via host staging. No-op on
+        backends without device transfer; only device-direct backends override."""
+        pass
+
+    def register_mem_pool_device_draft(self, mem_pool_device_draft):
+        """Task 6: register the EAGLE draft model's GPU KV pool for RDMA (GPUDirect),
+        so draft KV pages transfer device-direct under L2-bypass. No-op on backends
+        without device transfer; only device-direct backends override."""
+        pass
+
+    def batch_set_v1_device_draft(
+        self,
+        keys: List[str],
+        device_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Task 6: best-effort device-direct write of the EAGLE draft KV pages
+        (distinct `.draft` key namespace). Only device-direct backends override."""
+        raise NotImplementedError()
+
+    def batch_get_v1_device_draft(
+        self,
+        keys: List[str],
+        device_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Task 6: best-effort device-direct read of the EAGLE draft KV pages. The
+        read twin of batch_set_v1_device_draft. Only device-direct backends
+        override."""
+        raise NotImplementedError()
+
     def batch_set_v1_device(
         self,
         keys: List[str],
@@ -197,9 +230,10 @@ class HiCacheStorage(ABC):
     ) -> dict[str, List[bool]]:
         """DSA / hybrid L2-bypass backup (increment 2.5): the anchor "kv" pool
         (the big MLA latent) RDMAs straight from its GPU slots to L3 via the
-        device-direct SG put, while the small sidecar pool(s) (DSA indexer) ride
-        the host v2 path. Returns a dict mapping pool name -> per-page success
-        list (with the anchor under "kv"). Only backends that advertise
+        device-direct SG put. A sidecar transfer carrying device_indices (task 4)
+        RDMAs the DSA indexer device-direct too; one carrying host_indices rides the
+        host v2 path. Returns a dict mapping pool name -> per-page success list (with
+        the anchor under "kv"). Only backends that advertise
         supports_device_transfer() AND expose the v2-device ABI override this."""
         raise NotImplementedError()
 
@@ -212,10 +246,10 @@ class HiCacheStorage(ABC):
     ) -> dict[str, List[bool]]:
         """DSA / hybrid L2-bypass on-demand read: the read twin of
         batch_set_v2_device. The anchor "kv" pool RDMAs straight INTO its GPU slots
-        via the device-direct SG get; the sidecar pool(s) are read into their host
-        buffers via the v2 host path (the controller then H2Ds the sidecar into its
-        device index buffer). Returns a dict mapping pool name -> per-page hit
-        list."""
+        via the device-direct SG get; a device sidecar transfer (task 4) RDMAs the
+        indexer straight INTO its GPU index buffer too, while a host sidecar transfer
+        is read into its host buffer via the v2 host path. Returns a dict mapping pool
+        name -> per-page hit list."""
         raise NotImplementedError()
 
     def batch_exists_v2(
