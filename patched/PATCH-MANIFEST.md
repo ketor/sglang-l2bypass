@@ -1,0 +1,451 @@
+# PATCH-MANIFEST — HiCache L2-bypass, Increments 1+2 (device-direct write + read)
+
+SGLang v0.5.15.post1. Every change is guarded by the prototype flag
+`SGLANG_HICACHE_L2_BYPASS=1`; with the flag off (or a backend that does not
+advertise `supports_device_transfer()`), behavior is byte-identical to stock.
+
+- **Increment 1** = device-direct WRITE (write-through RDMAs straight from GPU KV
+  slots to L3, no D2H). Documented below.
+- **Increment 2** = device-direct READ (on-demand: discover L3 by exist query,
+  then RDMA pages straight INTO GPU KV slots via SG GET, no host staging). New
+  section "Increment 2" at the end. The scheduler and schedule_policy are
+  UNPATCHED — the read reuses their existing hicache entry points
+  (prefetch_from_storage / check_prefetch_progress / match_prefix /
+  init_load_back / ready_to_load_host_cache / is_load_back_event_done), dispatched
+  to device-direct behavior internally when `self.l2_bypass`.
+
+DSA / hybrid-pool models (GLM-5.2 etc.) take a DIFFERENT controller
+(`HybridCacheController`). Increments 1+2 left DSA on the stock host path;
+**Increment 2.5** (new section at the very end) extends device-direct to DSA:
+the main MLA latent goes device-direct while the small DSA indexer sidecar stays
+on the host v2 path, driven by a patched `HybridCacheController` and the
+backend's `batch_set_v2_device` / `batch_get_v2_device` split-value ABI.
+
+## Bind-mount targets
+
+Resolve the installed SGLang location once inside the container:
+
+```bash
+SGLANG=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))")
+```
+
+Then add these to the serve `docker run` (source = this `patched/` dir, mounted
+read-only over the matching site-packages file):
+
+```
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hiradix_cache.py:$SGLANG/srt/mem_cache/hiradix_cache.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hicache_storage.py:$SGLANG/srt/mem_cache/hicache_storage.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_page_meta.py:$SGLANG/srt/mem_cache/device_page_meta.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/managers/cache_controller.py:$SGLANG/srt/managers/cache_controller.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hybrid_cache/hybrid_cache_controller.py:$SGLANG/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:ro
+```
+
+The last line (`hybrid_cache_controller.py`) is **Increment 2.5** — the DSA
+device-direct controller. It overwrites an EXISTING container file (unlike
+`device_page_meta.py`, which is new), so the mount is a straight replace. The
+container base path is `/sgl-workspace/sglang/python/sglang/srt/mem_cache/hybrid_cache/`.
+
+`device_page_meta.py` is a NEW file — the mount creates it (bind-mount over a
+non-existent path works for files; if the runtime rejects it, `touch` the target
+first in an init step, or copy instead of mount).
+
+The dfkv backend plugin (`integration/hicache/dfkv_hicache.py`) is delivered on
+the dfkv branch and mounted the same way the current deploy already mounts it
+(the `/root/dfkv-*` plugin dir); no new mount line beyond the existing one.
+
+Enable at runtime: set `SGLANG_HICACHE_L2_BYPASS=1` in the serve env.
+
+## Changed files / functions / guards
+
+### mem_cache/device_page_meta.py  (NEW)
+Layer-first GPU-pool scatter-gather page meta (the device analogue of
+`memory_pool_host.get_page_buffer_meta`). Pure python, no torch import.
+- `get_device_page_buffer_meta(pool, indices)` — per page, per sub-object
+  (k[,v]) a LIST of per-layer `(ptr,size)` segments; page-alignment assert.
+- `device_pool_regions(pool)` — `(base,nbytes)` per layer buffer for RDMA reg.
+- `supported(pool)` — MHA/MLA yes, DSA anchor pool no.
+Guard: only imported/called on the bypass path.
+
+### mem_cache/hicache_storage.py
+Base-class capability hooks on `HiCacheStorage` (defaults keep every existing
+backend on the stock path):
+- `supports_device_transfer()` → `False`
+- `register_mem_pool_device(mem_pool_device)` → store only
+- `batch_set_v1_device(...)` → `NotImplementedError`
+Guard: defaults are inert; only the dfkv backend overrides them.
+
+### managers/cache_controller.py
+- `env_l2_bypass()` (NEW module fn) — reads `SGLANG_HICACHE_L2_BYPASS`.
+- `HiCacheController.__init__` — `self.l2_bypass_requested = env_l2_bypass()`,
+  `self.l2_bypass = False`.
+- `attach_storage_backend` — calls `_maybe_enable_l2_bypass()`; resets
+  `l2_bypass=False` in the rollback path.
+- `detach_storage_backend` — resets `l2_bypass=False`.
+- `_maybe_enable_l2_bypass()` (NEW) — the capability gate: requires the flag,
+  `supports_device_transfer()`, the zero-copy v1 write path, and a successful
+  `register_mem_pool_device`; on success flips `self.page_set_func` to
+  `_page_set_zero_copy_device` and `self.l2_bypass=True`, else warns + stays
+  stock.
+- `write_device(...)` (NEW) — enqueue a device-only write op (no host alloc).
+- `start_writing()` — bypass branch: record empty start/finish events (no D2H),
+  append the ack; stock branch unchanged. Guard: `if self.l2_bypass`.
+- `write_storage_device(...)` (NEW) — enqueue a backup op whose `host_indices`
+  field carries DEVICE slot indices.
+- `_page_set_zero_copy_device(...)` (NEW) — `batch_set_v1_device` shim.
+- `_page_backup` — draft-L3 write skipped under bypass (`and not self.l2_bypass`).
+
+### mem_cache/hiradix_cache.py
+- `l2_bypass` (NEW property) — reads `cache_controller.l2_bypass`.
+- `_node_l3_backed(node)` (NEW) — bypass analogue of `node.backuped`, via a
+  dynamic `node.l3_backed` attribute (TreeNode/radix_cache.py untouched).
+- `write_backup` — dispatches to `_write_backup_device` under bypass.
+- `_write_backup_device(...)` (NEW) — no host slot; `write_device`; mark
+  `l3_backed`; `inc_lock_ref` to pin the GPU slot (RDMA source, deferred unlock).
+- `_finish_write_through_ack` — under bypass: skip the CPU store event, and do
+  NOT `dec_lock_ref` (deferred to the storage-backup ack). Guards on
+  `self.l2_bypass`.
+- `write_backup_storage` — dispatches to `_write_backup_storage_device` under
+  bypass.
+- `_write_backup_storage_device(...)` (NEW) — hand device slot indices (snapshot
+  to CPU) to `write_storage_device`; track in `ongoing_backup` for the deferred
+  unlock; no `protect_host()`.
+- `_walk_split_chain` (NEW, refactor) — the key/hash chain walk, shared by
+  `_concat_split_chain` (host) and the device backup.
+- `_concat_split_chain` — now a thin wrapper over `_walk_split_chain`.
+- `_inc_hit_count` — bypass re-write guard uses `l3_backed` (backuped stays
+  False in bypass).
+- `_drain_storage_control_queues_impl._drain_backup` — under bypass,
+  `dec_lock_ref(node)` (deferred device-slot unlock) instead of `release_host`.
+- `_force_release_pending_storage_ops` — same bypass unlock on detach/shutdown.
+- `_split_node` — propagate `l3_backed` + pending-write-through tracking to both
+  halves under bypass (stock only did this for `backuped` nodes).
+
+## Deferred-unlock state machine (the correctness-critical piece)
+
+Stock frees the GPU slot at the D2H ack (host now owns the copy). Bypass has no
+D2H, so the GPU slot IS the RDMA source and must stay pinned until the L3 PUT
+completes. States for one write-through node:
+
+1. `_inc_hit_count` ≥ threshold → `write_backup` → `_write_backup_device`:
+   `write_device` (records write ack event), `node.l3_backed=True`,
+   `inc_lock_ref(node)` (PIN). Tracked in `ongoing_write_through[node.id]`.
+2. `writing_check` sees the (immediate) write ack → `_finish_write_through_ack`:
+   clears `write_through_pending_id`, calls `write_backup_storage`
+   (→ `write_storage_device`, `ongoing_backup[op_id]=node`), and — unlike stock —
+   does NOT `dec_lock_ref`. Slot stays PINNED.
+3. Backup thread RDMAs device→L3 (`batch_set_v1_device`), enqueues the backup ack.
+4. `drain_storage_control_queues` → `_drain_backup` pops the ack →
+   `dec_lock_ref(node)` (UNPIN). Slot now evictable; L3 holds the page.
+
+A split between (1) and (4) carries the pin along the chain (lock_ref is copied
+to the new parent) and re-points the pending/backup tracking via
+`_replace_pending_write_through_node`; the `dec_lock_ref` at (4) balances the
+`inc_lock_ref` at (1) on the same (post-split) node identity. Detach/shutdown
+force-release (`_force_release_pending_storage_ops`) unpins any op stuck at (3).
+
+## Host-slot economy & read discoverability
+
+Bypass never allocates a host slot and never sets `host_value` (`backuped`
+stays False); L3 residence is tracked by the `l3_backed` marker only. The
+unchanged read path discovers L3 content by hash via the prefetch exist query
+(`_storage_hit_query`/`check_prefetch_progress`), NOT via the writer's local
+host nodes — so cross-instance reads do not depend on the writer's `host_value`.
+Same-instance re-load after GPU eviction, however, WOULD (in stock) rely on
+`backuped`/`host_value` to demote-not-drop; in bypass the evicted node is
+dropped and re-use goes through the L3 exist-query prefetch. That is increment-2
+territory and is left as a documented limitation, not hacked.
+
+## Load-bearing limitation (see report)
+
+The device segments concatenate LAYER-major; the stock page-first host read
+reconstructs TOKEN-major. They are transposes. A page written device-direct is
+byte-coherent only with a matching device-direct (layer-major) reader
+(increment 2), NOT with the unchanged host read. Increment 1 wires and offloads
+the write; enabling it in isolation is a benchmark/prototype mode. Proven by
+`test/python/test_dfkv_hicache_device_direct.py::TestDeviceDirectEndToEnd`.
+Increment 2 supplies that matching layer-major reader (below), so with both on,
+a device-written page reads back byte-identical (proven by
+`::TestDeviceDirectEndToEnd::test_device_direct_write_then_read_roundtrip`).
+
+---
+
+# Increment 2 — device-direct READ (on-demand)
+
+No new bind-mount files. All changes live in the already-mounted
+`hiradix_cache.py` / `managers/cache_controller.py` / `hicache_storage.py`, plus
+the dfkv backend plugin `integration/hicache/dfkv_hicache.py` (delivered on the
+dfkv branch, mounted as before). `device_page_meta.py` is reused UNCHANGED — the
+same per-layer `(ptr, size)` segment meta serves as SG-GET destinations/caps.
+
+Enable identically: `SGLANG_HICACHE_L2_BYPASS=1`. With it off, or on a backend
+without the SG-GET capability, the read path is byte-identical to stock.
+
+## Read state machine (bypass)
+
+Two scheduler-visible phases, both reusing UNPATCHED scheduler entry points:
+
+1. **Discover** (exist → markers). `prefetch_from_storage` (bypass) does NOT
+   prefetch into host and does NOT reserve HBM; it only RECORDS the request's
+   discovery intent (`_pending_l3_discovery[req_id]`) and pins the anchor
+   (`inc_lock_ref`) — collective-free, safe at queue-add. `check_prefetch_progress`
+   (bypass → `_run_l3_discovery`) then, INSIDE the TP-synchronized scheduling
+   loop, runs the exist query (`_storage_hit_query`), the cross-rank MIN
+   all_reduce (gate #3), the 256-token threshold (gate #2), and inserts
+   `l3_present` marker nodes (`_insert_helper_l3`) for the hit prefix. Returns
+   True (discovery is synchronous; the request advances the same round).
+2. **Load** (device-direct). `match_prefix` (bypass) climbs the `l3_present`
+   markers (they have no `host_value`, so it counts `len(node.key)`) and reports
+   the climb as `host_hit_length`, with `best_match_node` = deepest marker — so
+   `req.needs_host_load_back()` fires unchanged. `init_load_back` (bypass →
+   `load_from_storage_device`) allocates GPU slots for the marker chain and RDMAs
+   the pages straight in via `cache_controller.load_device_direct`
+   (→ `batch_get_v1_device`, a blocking scatter-gather GET into the per-layer
+   device segments — layer-major, matching the writer). `start_loading` (bypass)
+   records ONE CUDA fence event across all layers (see "the fence"). Completion
+   flows through the stock `is_load_back_event_done` / `loading_check` →
+   `dec_lock_ref` path, unchanged.
+
+## Changed files / functions / guards (increment 2)
+
+### managers/cache_controller.py
+- `load_device_direct(hash_values, node_id)` (NEW) — alloc GPU slots + blocking
+  `batch_get_v1_device` SG GET; returns `(device_indices, ok_pages)` where
+  `ok_pages` is the consecutive hit prefix (first miss/short read truncates).
+- `enqueue_device_load(device_indices, node_ids)` (NEW) — queue an
+  already-loaded device span onto `load_queue` for the fence pass.
+- `start_loading` — bypass branch: no H2D; record `start_event` + all layer
+  events on `load_stream` as the fence, append the ack. Guard `if self.l2_bypass`.
+
+### mem_cache/hicache_storage.py
+- `HiCacheStorage.batch_get_v1_device(...)` (NEW base hook) → `NotImplementedError`;
+  only the dfkv backend overrides. Inert for every other backend.
+
+### mem_cache/hiradix_cache.py
+- `_pending_l3_discovery` (NEW dict) — req_id → deferred discovery context.
+- `_node_l3_present(node)` / `_node_l3_resident(node)` (NEW) — marker predicates
+  (`l3_present` = discovered via exist; `_resident` = `l3_backed or l3_present`).
+- `prefetch_from_storage` — bypass branch: record intent + pin anchor; no host
+  prefetch, no HBM reservation, no collective.
+- `_run_l3_discovery(req_id)` (NEW) + `check_prefetch_progress` bypass dispatch —
+  exist query + cross-rank MIN + threshold + `_insert_helper_l3`; releases anchor.
+- `_insert_helper_l3(node, key, hash_value)` (NEW) — marker insert (value=None,
+  host_value=None, hash_value set, `l3_present=True`); device-direct analogue of
+  `_insert_helper_host`.
+- `_drop_l3_markers(nodes)` (NEW) — detach failed/partial markers deepest-first so
+  their tokens recompute.
+- `match_prefix` — bypass climb: count marker tokens by `len(key)` (no
+  `host_value`); best/last-host node climb uses `_node_l3_resident`. Stock climb
+  is asserted byte-identical (evicted stock nodes are always `backuped`).
+- `init_load_back` — bypass branch → `load_from_storage_device`; returns the
+  DEEPEST device-resident node after a partial load.
+- `load_from_storage_device(node, mem_quota)` (NEW) — the on-demand load: walk
+  marker chain, alloc + SG GET, TP-MIN gates (below), assign verified prefix,
+  drop failed suffix, pin + track for `loading_check`, enqueue the fence.
+- `reset` / `release_aborted_request` — drop `_pending_l3_discovery` and release
+  the anchor pin.
+
+## TP-MIN gate wiring (correctness-critical)
+
+Every rank runs the scheduling loop over the same requests in the same order, so
+all these NCCL all_reduces are balanced:
+- **Discovery** (`_run_l3_discovery`): one MIN of `storage_hit_count` — a page is
+  usable only if EVERY attn rank holds it (gate #3), before markers are inserted.
+- **Load** (`load_from_storage_device`): (a) MIN of device-alloc success — if any
+  rank could not allocate, all free + abort together (no per-rank prefix
+  divergence); (b) MIN of per-rank verified pages — the usable prefix is
+  truncated to the minimum, and the failed suffix's markers are dropped and
+  recompute. No partial-rank silent success (the exact hole vLLM's connector
+  guards at load: a rank that "loaded" fewer/short pages must not serve them).
+
+## The fence (RDMA → compute ordering)
+
+`batch_get_v1_device` is a BLOCKING scatter-gather GET; the NIC (GPUDirect)
+writes the GPU slots and the call returns only after the completions are
+observed. It runs on the scheduler thread inside `init_load_back`, before the
+batch forward launches — so a CPU happens-before already orders the writes ahead
+of any compute kernel. `start_loading` additionally records ONE CUDA event per
+layer on `load_stream` (the LayerDoneCounter the attention backend waits on via
+`wait_until`), so the compute stream also has an explicit stream-side dependency.
+A single event covers all layers — the one RDMA op filled every layer at once, so
+there is no per-layer overlap to stream (unlike stock's per-layer H2D).
+
+## DSA decision (honest fallback, no faking)
+
+Bypass is gated OFF for DSA / hybrid-pool models and they use the correct stock
+host path for BOTH write and read — no device-direct sidecar was implemented and
+none is faked. This is enforced THREE ways: (1) DSA models construct a
+`HybridCacheController`, which has no `l2_bypass` attribute, so the
+`l2_bypass` property is False; (2) `device_page_meta.supported()` returns False
+for `use_dsa` pools; (3) `_maybe_enable_l2_bypass` requires the single-pool
+zero-copy v1 write surface (`_page_set_zero_copy`), not the hybrid v2 path. So a
+GLM-5.2 DSA instance reads its sidecar (index_k) correctly via the unchanged
+host v2 machinery; it simply does not get device-direct. Revisiting DSA
+device-direct (sidecar host-read + H2D, or a v2 device variant) is future work.
+
+## Known limitations / deviations (increment 2)
+
+- **Synchronous on-demand GET.** The load's SG GET runs synchronously on the
+  scheduler thread during admission (`init_load_back`), not on a background load
+  thread. Correct and race-free (the fence is trivial — data is present on
+  return), but it does not overlap the GET with scheduling. The design's async
+  "in-flight load delays the request one round" refinement needs cross-thread
+  CUDA event ordering (a stream semaphore) that is not safely expressible at the
+  Python layer; deferred. `is_load_back_event_done` therefore returns True
+  immediately for bypass loads.
+- **Marker accumulation.** `l3_present` markers that are discovered but never
+  loaded (request never scheduled) are not device-evicted (they hold no memory)
+  and persist in the radix tree; loaded-then-evicted markers ARE dropped
+  (`_evict_regular`). A dedicated marker-pruning pass is future work.
+- **Optimistic budget on partial load.** `host_hit_length` reflects the full
+  discovered prefix; a rare transient partial GET loads less, so the request's
+  input budget was computed optimistically and the tail recomputes (handled by
+  chunked prefill). Not a correctness issue.
+- **SGLang-side pure-python tests not extractable here.** The marker
+  insert/climb logic is coupled to `TreeNode`/`RadixKey`/`_split_node` and needs
+  the torch+sglang runtime (absent in the dev box), so it is verified by
+  py_compile + review; the byte-exact behavior it depends on (layer-major SG
+  write/read) is proven on the dfkv side by the real-cache-node roundtrip test.
+
+---
+
+# Increment 2.5 — DSA / hybrid device-direct (main KV device + indexer host)
+
+Extends device-direct write AND read to DSA / hybrid-pool models (GLM-5.2,
+`DSATokenToKVPool` → `attach_hybrid_dsa_pool_to_hiradix_cache` →
+`HybridCacheController`). Enabled identically by `SGLANG_HICACHE_L2_BYPASS=1`;
+with it off, or a non-DSA hybrid (SWA/Mamba), or a backend without the v2-device
+ABI, the hybrid path is byte-identical to stock.
+
+## DSA value-layout decision (the split value)
+
+A DSA page's KV is a **composite**: the big MLA latent (`kv_buffer`, layer-first)
+plus a small DSA indexer sidecar (`index_k_with_scale_buffer`, layer-first). The
+split is honest, across two key namespaces, with NO C-server change:
+
+- **Main MLA latent → device-direct.** Stored under the v1-style, `@sg`-chunked
+  keys (`model/hash_k@sg{n}`) — the exact key scheme `batch_set_v1_device` /
+  `batch_exists` (`@sg0` probe) already use. RDMA'd straight from/into the GPU
+  `kv_buffer` slots via the layer-major SG put/get. `device_page_meta.supported()`
+  now accepts the DSA main latent (it IS MLA-shaped; the increment-1 `use_dsa`
+  veto is lifted because the sidecar finally has a home).
+- **DSA indexer sidecar → host v2 path.** Stored under its own keys
+  (`model/hash_indexer_k`) exactly as stock `batch_set_v2`. Written from / read
+  into its host buffer (`DSAIndexerPoolHost`), then H2D'd into the device index
+  buffer.
+
+The two components share nothing but the page hash and never collide (proven by
+`test_dsa_split_value_kv_and_sidecar_use_distinct_keys`).
+
+## Sidecar coexistence mechanics
+
+The indexer reuses the KV **page indices** (SidecarPoolSpec `indices_from_pool=KV`),
+so the main-KV device slots address the indexer device buffer too. The host slots
+that stage the indexer share the anchor MLA host pool's slot layout.
+
+- **WRITE.** `hiradix._write_backup_device` (hybrid branch) allocates anchor host
+  slots `side_h` for the indexer and calls `HybridCacheController.write_device
+  (device_indices, sidecar_host_indices=side_h)`. `start_writing` (bypass) does a
+  **sidecar-only D2H** (drives the indexer entry's `backup_from_device_all_layer`
+  directly — the anchor main KV is NOT copied to host). At storage backup,
+  `_page_backup_device` issues ONE `batch_set_v2_device(kv_keys, kv_device_indices,
+  sidecar_transfers)` per batch: main KV device-direct + indexer from host.
+  `side_h` is freed at the backup ack (`_drain_backup` →
+  `_release_bypass_sidecar_host`); the main-KV GPU slot's deferred unlock is
+  unchanged from increment 1.
+- **READ.** `HybridCacheController.load_device_direct` allocates the main-KV GPU
+  slots + a transient host staging span, issues ONE `batch_get_v2_device` (main KV
+  → GPU, indexer → host staging), then **synchronously H2Ds** the indexer prefix
+  into its device index buffer (`_sidecar_h2d`, on the load stream + sync) and
+  frees the staging. On return the GPU slots hold both latent and indexer.
+  `start_loading` (bypass) records the one-event fence. `hiradix.load_from_storage
+  _device`, discovery, markers, and TP-MIN gates are the SHARED increment-2
+  machinery — unchanged.
+
+## Capability gating (four-way, DSA)
+
+`HybridCacheController._maybe_enable_l2_bypass` requires, in order:
+1. the base gate (flag, `supports_device_transfer()`, the zero-copy v1 write
+   surface, **`device_page_meta.supported(main pool)`** — now added to the base
+   gate for all bypass, DSA or dense — and a successful `register_mem_pool_device`);
+2. the backend's v2-device split-value ABI (`batch_set_v2_device` AND
+   `batch_get_v2_device`);
+3. the DSA **anchor+INDEXER pool shape** (`_bypass_sidecar_supported`: every
+   sidecar is `INDEXER`). SWA/Mamba hybrids (trailing-page states with their own
+   indices) are declined — they keep the stock host path.
+
+Any miss logs a clear warning and stays on the stock host path.
+
+## Changed files / functions (increment 2.5)
+
+### mem_cache/device_page_meta.py
+- `supported(pool)` — lifted the `use_dsa` veto: a DSA pool's main latent is
+  MLA-shaped and expressible; the sidecar is the controller's concern, not this
+  module's.
+
+### mem_cache/hicache_storage.py
+- `HiCacheStorage.batch_set_v2_device(...)` / `batch_get_v2_device(...)` (NEW base
+  hooks) → `NotImplementedError`; only the dfkv backend overrides.
+
+### managers/cache_controller.py (base)
+- `_maybe_enable_l2_bypass` — added the `device_page_meta.supported(mem_pool_device)`
+  per-pool gate (inert for dense MLA/MHA; the honest capability check for DSA).
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py (NEW patched file)
+- `_sidecar_entries()`, `_bypass_sidecar_supported()`, `_maybe_enable_l2_bypass()`
+  (override, the four-way DSA gate).
+- `write_device(..., sidecar_host_indices)` (NEW) — bypass write enqueue (main KV
+  device + indexer sidecar host).
+- `write_storage_device(..., extra_pools)` (NEW) — bypass storage enqueue.
+- `start_writing` — bypass branch (sidecar-only D2H, no main-KV D2H).
+- `_page_backup` — bypass branch → `_page_backup_device` (`batch_set_v2_device`).
+- `load_device_direct` (NEW) — bypass v2-device read + synchronous `_sidecar_h2d`.
+- `_sidecar_h2d` (NEW), `enqueue_device_load` (override, hybrid CacheOperation),
+  `start_loading` — bypass one-event fence branch.
+
+### mem_cache/hiradix_cache.py
+- `_write_backup_device` — hybrid branch allocates the indexer host staging slots
+  and passes `sidecar_host_indices`; stores them on `node.bypass_sidecar_host`.
+- `_write_backup_storage_device` — hybrid branch builds the concrete sidecar
+  `PoolTransfer` (concatenated over a split chain) and passes it as `extra_pools`;
+  stashes the concatenated slots on `node.bypass_backup_sidecar_host`.
+- `_release_bypass_sidecar_host` (NEW) — frees those staging slots at the backup
+  ack; wired into `_drain_backup` and `_force_release_pending_storage_ops`.
+- `_split_node` — split `bypass_sidecar_host` alongside `value` (bypass).
+- `_run_l3_discovery` — build a `HybridPrefetchOperation` with the sidecar
+  `pool_transfers` for hybrid, so discovery gates via `batch_exists_v2` (a page is
+  present only if BOTH the main KV `@sg0` AND the indexer are in L3).
+
+### dfkv backend `integration/hicache/dfkv_hicache.py` (branch feat/hicache-device-direct-put)
+- `batch_set_v2_device` / `batch_get_v2_device` (already committed at 8d6ec96),
+  `_kv_device_set` / `_kv_device_get` helpers: main KV device SG IO + sidecar host
+  v2 IO, preserving the stock DSA metric split (`on_set`/`on_get` for the anchor,
+  `on_set_v2`/`on_get_v2` for the sidecar).
+
+## Tests (increment 2.5)
+
+dfkv side (real cache node, no GPU): `test/python/test_dfkv_hicache_device_direct.py`
+- `test_dsa_split_value_write_then_read_roundtrip` — write a DSA page
+  (main KV device layer-major + indexer host) then read BOTH back into fresh
+  destination pools; assert every main-KV layer page AND the indexer page are
+  byte-identical to source.
+- `test_dsa_split_value_kv_and_sidecar_use_distinct_keys` — the two components
+  live under distinct key namespaces (no collision).
+- All 22 device-direct tests pass (20 prior + 2 new); the full hicache suite is
+  91 passed. Committed on the branch (no push).
+
+## Known limitations / deviations (increment 2.5)
+
+- **SGLang-side verified by py_compile + review only** (no GPU / GLM-5.2 in the
+  dev box), exactly as increments 1+2. The byte-exact split-value roundtrip — the
+  load-bearing correctness claim — IS proven at the dfkv backend by the new
+  real-cache-node test.
+- **Host-pool allocation NOT eliminated for DSA.** The indexer reuses the anchor
+  MLA host pool's slot layout, so bypass still allocates anchor host slots to index
+  the indexer staging; only the expensive main-KV **D2H** is eliminated, not the
+  host-pool sizing. An operator who shrank the host pool expecting full L2 removal
+  will see `write_backup` return 0 (recompute-safe) under host pressure.
+- **Synchronous sidecar H2D on the scheduler thread** (inside `load_device_direct`),
+  like increment 2's synchronous GET — correct/race-free but no overlap.
+- **Split-chain sidecar path** (a write-through node split between enqueue and
+  backup) concatenates the chain's `bypass_sidecar_host`; review-verified, not
+  GPU-exercised.
