@@ -38,7 +38,16 @@ read-only over the matching site-packages file):
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_page_meta.py:$SGLANG/srt/mem_cache/device_page_meta.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/managers/cache_controller.py:$SGLANG/srt/managers/cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hybrid_cache/hybrid_cache_controller.py:$SGLANG/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/pool_host/base.py:$SGLANG/srt/mem_cache/pool_host/base.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/pool_host/bypass.py:$SGLANG/srt/mem_cache/pool_host/bypass.py:ro
 ```
+
+The last two lines (`pool_host/base.py`, `pool_host/bypass.py`) are **Increment 6**
+— the stub host pool. `base.py` overwrites an EXISTING container file (straight
+replace); `bypass.py` is a NEW file — the mount creates it (same new-file caveat
+as `device_page_meta.py`: if the runtime rejects a bind-mount over a non-existent
+path, `touch` the target first or copy instead). The container base path is
+`/sgl-workspace/sglang/python/sglang/srt/mem_cache/pool_host/`.
 
 The last line (`hybrid_cache_controller.py`) is **Increment 2.5** — the DSA
 device-direct controller. It overwrites an EXISTING container file (unlike
@@ -892,3 +901,135 @@ thread (pure RDMA, no collective).
   draft indexer). No faking.
 - **Draft indexer host residual = 0.** Like the target sidecar (task 4), the draft
   indexer rides its GPU buffer device-direct; no draft host staging is allocated.
+
+---
+
+# Increment 6 — L2-bypass STUB host pool (drop the idle --hicache-size pinned buffer)
+
+Increments 1-5 eliminated every host-slot USE under bypass (main KV, DSA indexer
+sidecar, and draft all device-direct; "Host-pool residual audit" above = 0 host
+slots allocated on any bypass path). But the host pool was still CONSTRUCTED at
+its full `--hicache-size` — a multi-GB `cudaHostRegister`'d buffer sitting idle.
+Increment 6 makes it a true stub: under bypass the host pool holds a few pages
+(~a few MB) instead of GB, so host footprint drops from `--hicache-size` GB to
+tens of MB while bypass behavior/performance is unchanged (the data path is
+GPUDirect GPU<->L3, never these host slots). Still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1`; with it off, byte-identical to stock.
+
+## New bind-mount files
+`mem_cache/pool_host/base.py` (overwrites; the `HostKVCache` base constructor) and
+`mem_cache/pool_host/bypass.py` (NEW; pure torch-free helpers). Both listed in the
+bind-mount block at the top.
+
+## The construction-order problem (why the gate lives in the base constructor)
+The host pool is built in `HiRadixCache.__init__` / the DSA assembler **before**
+the storage backend attaches, so the controller's full capability gate
+(`_maybe_enable_l2_bypass`, which also needs `supports_device_transfer()` + the
+v2-device ABI) has NOT run yet. At construction we know only: the env flag + the
+GPU pool shape. So the stub gate is `SGLANG_HICACHE_L2_BYPASS requested AND
+device_page_meta.supported(device_pool)` — the same "is this pool device-direct
+expressible" predicate the controller uses, evaluated on the info available early.
+
+**Safety net for the residual case** (flag on, pool expressible, but the
+controller later DECLINES bypass for a backend reason — non-device backend, or an
+HCA too narrow for the `@sg` chunking): the stock host path still runs correctly
+against a stub, because **every** `mem_pool_host.alloc` caller treats
+`alloc()==None` (a full/tiny pool) as a **recompute-safe skip** — `write()`
+returns None, `prefetch_from_storage` releases and returns, both no-op. L2 just
+goes ineffective; correctness is preserved. Verified by reading all stock alloc
+sites (`cache_controller.write`, `hiradix.prefetch_from_storage`, the hybrid
+controller's `write`). The degrade is LOUD: the stub log at construction + the
+controller's decline warning. Never silent corruption.
+
+## What gets stubbed (one surgical point covers all)
+The change is entirely in `HostKVCache.__init__` (the base every host pool goes
+through). One gate there transitively covers:
+- **Dense MLA / MHA** host pools (direct `MLATokenToKVPoolHost` /
+  `get_mha_host_pool_cls`).
+- **DSA main latent** (`MLATokenToKVPoolHost` via the hybrid assembler's
+  `_build_kv_host_pool`).
+- **DSA indexer sidecar** (`DSAIndexerPoolHost`) — NOT patched directly: it sets
+  `self.size = anchor_host.size` / `self.page_num = anchor_host.page_num`, so when
+  the anchor MLA host pool is stubbed the indexer inherits the tiny size and
+  allocates a tiny buffer automatically. Its own memory check/log then report the
+  (tiny) figure honestly. No `memory_pool_host.py` change needed.
+- **EAGLE draft** host pool (`MLATokenToKVPoolHost` for a DSA draft) — same base
+  constructor, same stub.
+
+`HostPoolGroup.size` also derives from `anchor.host_pool.size`, so the aggregate
+DSA pool view inherits the stub too.
+
+**Not stubbed (correctly):** Mamba/SWA/sparse pools — `device_page_meta.supported`
+is False for them, so they keep the real host pool and the honest stock path
+(bypass is declined for those models anyway). Note `MambaPoolHost` also has its own
+inline sizing (not the base path), so it is doubly excluded.
+
+## Downstream `host.size` dependencies (grep-verified none break)
+- **Gate #1 prefetch budget** (`0.5 * mem_pool_host.size`): already re-anchored to
+  `0.3 * device capacity` under bypass by increment 3; the stubbed host size is not
+  read on the bypass path. On the stock fallback it becomes `0.5 * tiny` → prefetch
+  effectively off, consistent with a tiny pool.
+- **`DSAIndexerPoolHost.size` / `.page_num`**: inherit the stubbed anchor (above).
+- **`HostPoolGroup.size`**: inherits the stubbed anchor.
+- **`available_size()` reads** (hiradix prefetch shrink path): return the tiny free
+  count → the None-handling shrink/skip path fires. Recompute-safe.
+- **`draft_host_pool.size`** (cache_controller:1149): log string only.
+- **Slot-range asserts**: `alloc` only asserts `need_size % page_size == 0` and
+  returns None when `need_size > available` — no hard assert on `size`. Staging
+  buffers use `min(page_num, 64)` with `page_num >= 1` → no divide-by-zero.
+
+## Sizing math
+Stub `self.size = _L2_BYPASS_STUB_PAGES * page_size` (raw), then the UNCHANGED
+stock page-align (`page_num = size // page_size + 1; size = page_num * page_size`)
+→ `(_L2_BYPASS_STUB_PAGES + 1) * page_size` tokens = 2 pages at
+`_L2_BYPASS_STUB_PAGES=1`. Positive, page-aligned, non-zero for any page size (the
+`< 4GB` divide-by-zero the operator hit was the GB→token conversion underflowing /
+downstream framework asserts; the stub sets the token count directly and never
+touches that path). At a GLM-5.2-ish ~45 KB/token main latent + page 64, the main
+buffer is ~5.8 MB; the indexer + draft add a few MB more — total tens of MB.
+
+## `--hicache-size` semantics under bypass+stub
+`--hicache-size` becomes **irrelevant** — the stub ignores it and logs so at
+construction: `HiCache L2-bypass stub host pool (<cls>): --hicache-size ignored,
+host footprint ~XX MB (<n> tokens x <b> B/token); GPUDirect GPU<->L3 owns the data
+path.` Operators can leave the production `--hicache-size 32` in the serve command
+unchanged; it no longer sizes anything under bypass. (The increment-4 proof that
+`hicache=4` still reads back byte-correct was the earlier "shrink the arg"
+demonstration; increment 6 makes the shrink automatic and total.)
+
+## Changed files / functions (increment 6)
+### mem_cache/pool_host/bypass.py (NEW, pure — no torch/sglang at module load)
+- `_L2_BYPASS_STUB_PAGES = 1`; `env_l2_bypass_requested()`;
+  `l2_bypass_stub_raw_tokens(page_size)` / `l2_bypass_stub_tokens(page_size)` (the
+  pre-/post-align token counts, exposed for tests);
+  `l2_bypass_stub_applies(device_pool)` — the gate (env flag AND lazy
+  `device_page_meta.supported`; any import failure → False = keep real pool).
+
+### mem_cache/pool_host/base.py
+- `HostKVCache.__init__` — compute `self.l2_bypass_stub = l2_bypass_stub_applies(
+  device_pool)`; when set, size from `_L2_BYPASS_STUB_PAGES` instead of
+  `--hicache-size`/ratio and skip the big-memory warning+check in favor of the stub
+  log. **Stock branches are byte-identical, merely re-indented under `else:`**; with
+  the flag off `l2_bypass_stub` is False (env short-circuit, no device_page_meta
+  import) and the original path runs verbatim.
+
+## Tests (increment 6)
+`tests/test_l2_bypass_stub.py` (pure python, no GPU/torch): env-flag parser
+(truthy/falsy/whitespace), stub token count is positive+page-aligned+non-zero for
+page sizes 1..256, final == raw + page_size (matches the constructor align),
+footprint stays tens-of-MB, and the gate short-circuits on the env flag /
+defers to a (fake-injected) `device_page_meta.supported` / declines on
+missing-module. 11 tests pass. The base constructor's torch-coupled allocation is
+py_compile + review only (no GPU on the dev box), as increments 1-5.
+
+## Known limitations / deviations (increment 6)
+- **SGLang-side allocation verified by py_compile + review + pure-logic unit tests**
+  (no GPU on the dev box). Needs a GPU run to confirm the host RSS drop (expect the
+  hicache buffer to vanish from host memory) and that GLM-5.2 DSA+EAGLE+bypass
+  needle stays byte-correct with the stub — i.e. the increment-4 `hicache=4` proof,
+  now with the buffer stubbed at the source rather than shrunk by the arg.
+- **Flag-on + expressible pool + later backend decline** degrades to stock-with-no-
+  effective-L2 (recompute-safe, loud), NOT byte-identical to a real-host stock run.
+  This only affects a config that requests bypass on a backend that cannot honor it;
+  the production node (dfkv device-direct) always enables bypass. Documented, not
+  hidden.
