@@ -80,6 +80,20 @@ def env_l2_bypass_sync_read() -> bool:
     ).strip().lower() not in ("", "0", "false", "no", "off")
 
 
+def env_l2_bypass_fuse_draft() -> bool:
+    """Increment 7: SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=0 reverts the EAGLE draft
+    L3 IO to its own RDMA round trip (the increment-4/5 standalone
+    batch_set/get_v1_device_draft calls). Default ON => the draft's sub-keys ride
+    INSIDE the target page's scatter-gather batch, so draft L3 adds no RDMA op.
+    Same keys, same bytes, same results either way — purely an op-count knob, kept
+    so the draft-fusion effect can be A/B'd without redeploying. Only meaningful
+    when SGLANG_HICACHE_L2_BYPASS=1 and the backend advertises
+    supports_fused_draft_device()."""
+    return os.environ.get(
+        "SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT", "1"
+    ).strip().lower() not in ("", "0", "false", "no", "off")
+
+
 class DeviceLoadTask:
     """L2-bypass async read (increment 3): one on-demand device-direct load handed
     to the background device-load thread.
@@ -326,6 +340,11 @@ class HiCacheController:
         # pool is a plain MLA/MHA (device-SG expressible, non-DSA). Off => draft L3
         # stays disabled under bypass (honest degrade, as increments 1-3).
         self.draft_device_enabled = False
+        # Increment 7: when True the draft rides the target's SG batch (no
+        # standalone draft RDMA op). Requested by env, granted at attach only if
+        # the backend advertises supports_fused_draft_device().
+        self.draft_fuse_requested = env_l2_bypass_fuse_draft()
+        self.draft_device_fused = False
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -922,10 +941,15 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(total_tokens)
         if device_indices is None:
             return None, 0
-        results = self.storage_backend.batch_get_v1_device(hash_values, device_indices)
+        results = self.storage_backend.batch_get_v1_device(
+            hash_values, device_indices,
+            with_draft=self.draft_rides_target_batch,
+        )
         # Task 6: best-effort device-direct draft GET into the draft GPU slots (sync
-        # read mode; the async path does the equivalent in _run_device_get).
-        if self.has_draft and self.draft_device_enabled:
+        # read mode; the async path does the equivalent in _run_device_get). Skipped
+        # when fused (increment 7) — the GET above already carried the draft.
+        if (self.has_draft and self.draft_device_enabled
+                and not self.draft_device_fused):
             try:
                 self.storage_backend.batch_get_v1_device_draft(
                     hash_values, device_indices)
@@ -985,7 +1009,8 @@ class HiCacheController:
         """Background thread: the blocking scatter-gather GET into the pre-allocated
         GPU slots + local hit-prefix count. Dense v1. No CUDA ops, no collective."""
         results = self.storage_backend.batch_get_v1_device(
-            task.hash_values, task.device_indices
+            task.hash_values, task.device_indices,
+            with_draft=self.draft_rides_target_batch,
         )
         # Task 6: best-effort device-direct draft GET into the draft GPU slots (same
         # slots), also pure RDMA — background-safe. Does not gate the target verify.
@@ -1285,6 +1310,7 @@ class HiCacheController:
 
         Best-effort: any miss logs once and leaves draft L3 disabled (recompute-safe)."""
         self.draft_device_enabled = False
+        self.draft_device_fused = False
         if not (self.l2_bypass and self.has_draft and self.enable_storage):
             return
         backend = self.storage_backend
@@ -1327,16 +1353,36 @@ class HiCacheController:
                 "leaving draft L3 off under bypass.")
             return
         self.draft_device_enabled = True
+        # Increment 7: fuse the draft into the target's SG batch when the backend
+        # can carry it (same page hashes, same device slots, distinct namespace),
+        # so draft L3 costs zero extra RDMA ops on the backup and load paths.
+        self.draft_device_fused = bool(
+            self.draft_fuse_requested
+            and callable(getattr(backend, "supports_fused_draft_device", None))
+            and backend.supports_fused_draft_device()
+        )
         logger.info(
             "HiCache draft L3 ENABLED under L2-bypass: draft KV RDMAs device-direct "
-            "(best-effort) alongside the target%s. Backend=%r.",
+            "(best-effort) alongside the target%s, %s. Backend=%r.",
             " (DSA: latent + indexer sidecar)" if draft_is_dsa else "",
+            "FUSED into the target SG batch (no extra RDMA op)"
+            if self.draft_device_fused else "in its own RDMA op (unfused)",
             self.storage_backend_type)
+
+    @property
+    def draft_rides_target_batch(self) -> bool:
+        """Increment 7: True when the draft's sub-keys are carried by the target's
+        own device SG batch (`with_draft=True`), so the standalone draft ops below
+        must NOT also run. Read by the backup/load call sites."""
+        return self.draft_device_enabled and self.draft_device_fused
 
     def _draft_device_set(self, hash_values, device_indices) -> None:
         """Best-effort device-direct draft L3 write (task 6). Mirrors _draft_page_set
         but RDMAs from the draft GPU pool's slots (device_indices)."""
-        if not self.draft_device_enabled:
+        if not self.draft_device_enabled or self.draft_device_fused:
+            # Fused (increment 7): the target's batch_set_*_device already carried
+            # the draft sub-keys in the same SG put — a second op here would be a
+            # pure duplicate.
             return
         try:
             self.storage_backend.batch_set_v1_device_draft(hash_values, device_indices)
@@ -1351,7 +1397,9 @@ class HiCacheController:
         slots — no CUDA, no collective, so it is background-safe). Failure just means
         the draft model recomputes those pages (EAGLE verifies against the target, so
         a missing/partial draft only lowers acceptance, never correctness)."""
-        if not self.draft_device_enabled:
+        if not self.draft_device_enabled or self.draft_device_fused:
+            # Fused (increment 7): the target's batch_get_*_device already carried
+            # the draft sub-keys in the same SG GET.
             return
         try:
             self.storage_backend.batch_get_v1_device_draft(
@@ -1608,9 +1656,13 @@ class HiCacheController:
         # L2-bypass: `device_indices` are GPU slot indices (StorageOperation carried
         # them in its host_indices field via write_storage_device). The backend
         # reads device page meta and RDMAs from the GPU pool.
+        # Increment 7: with_draft asks the backend to carry the EAGLE draft's
+        # sub-keys in this same SG put (same hashes, same slots) instead of a
+        # second RDMA op; _draft_device_set is then inert. Inert when unfused.
         return all(
             self.storage_backend.batch_set_v1_device(
-                hash_values, device_indices, extra_info
+                hash_values, device_indices, extra_info,
+                with_draft=self.draft_rides_target_batch,
             )
         )
 

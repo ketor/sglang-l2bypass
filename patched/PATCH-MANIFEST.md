@@ -1033,3 +1033,169 @@ py_compile + review only (no GPU on the dev box), as increments 1-5.
   This only affects a config that requests bypass on a backend that cannot honor it;
   the production node (dfkv device-direct) always enables bypass. Documented, not
   hidden.
+
+---
+
+# Increment 7 — FUSE the EAGLE draft into the target's SG batch (draft L3 costs no extra RDMA op)
+
+One change on top of increments 1/2/2.5/3/4/5/6, still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1` (with it off, byte-identical to stock). **No new
+bind-mount files** — the SGLang changes live in the already-mounted
+`managers/cache_controller.py`, `mem_cache/hybrid_cache/hybrid_cache_controller.py`
+and `mem_cache/hicache_storage.py`, plus the existing dfkv backend mount.
+
+## What this is NOT (diagnosis first — two proposed fixes were provably no-ops)
+
+The brief was "draft-L3 re-writes hot pages every decode; add a dedup gate like the
+main KV's `l3_backed`". Reading the shipped paths, **that premise does not hold and
+two of the three proposed routes would have changed nothing**:
+
+1. **There is no draft-only write path.** `_draft_device_set` is called from exactly
+   two places — `HiCacheController._page_backup` (dense) and
+   `HybridCacheController._page_backup_device` (DSA) — both INSIDE the per-batch loop
+   of a storage backup operation. A backup op only exists if
+   `hiradix._inc_hit_count` → `write_backup` → `_write_backup_device` ran, and that is
+   already gated by
+   `already_backed = node.backuped or (l2_bypass and _node_l3_backed(node))`
+   (`hiradix_cache.py:1108`). **Draft writes are a strict subset of main-KV
+   write-through events**, so they cannot fire "every decode step" while the main KV
+   stays quiet. Route (a) `draft_l3_backed` and route (b) "reuse the main
+   `l3_backed`" are therefore both no-ops: (b) IS the status quo, and (a) would be a
+   second marker on the same node with the same lifetime.
+2. **Route (c) — the dfkv exist-dedup gate — is already wired on the draft path.**
+   `batch_set_v1_device_draft` puts through `_put_sg_flat`
+   (`dfkv_hicache.py:939`), whose `_backup_exist_gate` (default on,
+   `DFKV_BACKUP_EXIST_GATE`) probes first and skips every already-present sub-key;
+   the draft indexer goes through `_sidecar_device_set` → the same `_put_sg_flat`.
+   So a genuinely redundant draft PUT already costs a probe and zero bytes.
+
+**What draft-L3 actually costs in a hot round is RDMA OP COUNT, not bytes.** With the
+draft on, a DSA backup batch issued 4 exist probes + up to 4 SG puts (target latent,
+target indexer, draft latent, draft indexer) instead of 2 + 2, and — the one that
+sits on the TTFT critical path — an async device LOAD issued 4 SG GETs instead of 2,
+on the background load thread every rank waits for. The draft's bytes are ~1.3% of a
+page (GLM-5.2: draft latent 576 B/token + indexer 128 B/token vs the target's
+44,928 + 9,984), but it **doubled the ops**.
+
+## The change: same keys, same bytes, half the ops
+
+The draft is addressed by *exactly* the same page hashes and the same device slot
+indices as the target (it rides the slots the target rode); only the key namespace
+differs (`.draft_k` / `draft_indexer`). So its sub-keys can simply be **appended to
+the target's scatter-gather batch** instead of getting their own round trip. Nothing
+about what lands in L3 changes — which is why **R3 is preserved by construction**
+(proven both directions by the roundtrip tests below: fused-written pages read back
+through the standalone draft ABI and vice versa).
+
+New sub-flag `SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT` (default **1** = fused). Set to 0
+to revert to the increment-4/5 standalone draft ops for a single-variable A/B without
+redeploying.
+
+### mem_cache/hicache_storage.py (base hooks, inert defaults)
+- `supports_fused_draft_device()` (NEW) → `False`; only dfkv overrides.
+- `batch_set_v1_device` / `batch_get_v1_device` / `batch_set_v2_device` /
+  `batch_get_v2_device` — added `with_draft: bool = False` to the signatures.
+
+### managers/cache_controller.py
+- `env_l2_bypass_fuse_draft()` (NEW module fn); `self.draft_fuse_requested`,
+  `self.draft_device_fused` (`__init__`).
+- `_maybe_enable_device_draft` — resets `draft_device_fused=False` at entry, and on
+  success grants it when the env flag is on AND the backend advertises
+  `supports_fused_draft_device()`. The enable log now states FUSED / unfused.
+- `draft_rides_target_batch` (NEW property) = `draft_device_enabled and
+  draft_device_fused` — the single switch every call site reads.
+- `_draft_device_set` / `_maybe_device_draft_get` — return early when fused (the
+  target's batch already carried the draft; a second op would be a pure duplicate).
+- `_page_set_zero_copy_device` (dense backup), `load_device_direct` (sync read),
+  `_run_device_get` (async read) — pass `with_draft=self.draft_rides_target_batch`.
+
+### mem_cache/hybrid_cache/hybrid_cache_controller.py
+- `_page_backup_device`, `load_device_direct`, `_run_device_get` — pass
+  `with_draft=self.draft_rides_target_batch` to `batch_set_v2_device` /
+  `batch_get_v2_device`.
+
+### dfkv backend `integration/hicache/dfkv_hicache.py` (branch feat/hicache-device-direct-put)
+- `supports_fused_draft_device()` (NEW) → True (capability probe).
+- `_draft_device_flat(keys, device_indices, putting)` (NEW) — builds the draft's flat
+  SG group (latent `@sg` sub-keys + , for a DSA draft, the `draft_indexer` sub-keys)
+  from the SAME keys/indices, or returns None when it must not fuse (see the rank-skip
+  guard below).
+- `_fused_draft_or_fallback(...)` (NEW) — returns the group, or runs the standalone
+  `batch_set/get_v1_device_draft` and returns None. Best-effort (swallows), because
+  the SGLang side has already skipped its own call.
+- `_kv_device_set` / `_kv_device_get` — new `extra=(sks, ptrs, sizes)` param appended
+  to the one batch; the fold and the byte count are sliced back to the MAIN prefix so
+  the target's per-page results and the `on_set`/`on_get` byte attribution are
+  unchanged (the draft's bytes belong to no target metric).
+- `batch_set_v1_device` / `batch_get_v1_device` / `batch_set_v2_device` /
+  `batch_get_v2_device` — new `with_draft=False` param. `batch_set_v1_device` now
+  delegates its body to `_kv_device_set` (identical logic, no duplication).
+- `batch_set_v1_device_draft` / `batch_get_v1_device_draft` are UNCHANGED and remain
+  the fallback + the existing tests' entry point.
+
+## 🔴 The rank-skip guard (the one correctness trap)
+Fusing merges two skip decisions into one, so it is only sound when they agree:
+- target write: skipped on `is_mla and tp_rank != 0` (replicated MLA latent);
+- draft latent write: skipped on `draft_sub == 1 and tp_rank != 0` — the draft's own
+  MLA-ness, which is INDEPENDENT of the target's.
+
+`_draft_device_flat(putting=True)` returns None when `(draft_sub == 1) != is_mla`
+(e.g. MLA target + MHA draft), and the caller keeps the standalone draft op so its
+semantics are untouched. GLM-5.2 (MLA target + MLA MTP draft) and dense+dense both
+agree, so both fuse. The draft **indexer** skips on `is_mla` (it goes through the
+shared `_sidecar_device_set`), i.e. identical to the target's, so once the latent
+check passes the whole group is skip-compatible. **Reads have no rank skip anywhere**,
+so a read always fuses.
+
+## TP-consistency (unchanged invariant)
+No collective sequence changed — this is entirely below the collective layer. The
+fused write/read are local RDMA on the backup / background-load threads exactly as
+before; the async read's balanced per-round done-MIN / alloc-MIN / pages-MIN
+(increment 3) are untouched. The draft's per-page results are still discarded by the
+caller (best-effort), so a draft miss cannot truncate the target's verified prefix —
+asserted by `test_fused_read_of_absent_draft_still_serves_the_target`.
+
+## Tests
+dfkv `test/python/test_dfkv_hicache_device_direct.py` (+11, `-k hicache` 99 → **110**):
+- real cache node: `test_fused_draft_write_is_readable_by_the_unfused_draft_path`
+  and `test_unfused_draft_write_is_readable_by_the_fused_read` (**the R3-preservation
+  proof, both directions** — a fused write is byte-exact through the standalone ABI
+  and vice versa, which is the actual cross-restart shape),
+  `test_fused_v2_device_roundtrip_all_four_components` (DSA: target latent + target
+  indexer + draft latent + draft indexer all byte-exact in one put + one get),
+  `test_fused_read_of_absent_draft_still_serves_the_target`.
+- pure `TestFusedDraftGrouping` (7): which sub-keys get fused (DSA vs dense), decline
+  with no draft pool, **the put-side rank-skip disagreement declines while the get
+  fuses**, the fallback really issues the standalone op, and the op-count collapse —
+  `{exist:3, put:3} → {exist:1, put:1}` and 2 SG GETs → 1.
+- Mutation-checked: corrupting the fused key namespace fails 5 of the new tests.
+
+SGLang `patched/tests/test_fused_draft_gate.py` (NEW, 9 tests, torch-free): the env
+parser, the `draft_rides_target_batch` decision table, the standalone ops being its
+exact complement (so the draft is never written twice nor lost), best-effort failure
+swallowing, and a source-level guard that all four device call sites pass
+`with_draft=`. These AST-extract and execute the REAL function bodies from the
+shipped files rather than re-implementing them. `py_compile` clean on all patched
+files; increments 3/4/6 unit tests still pass (13 / 9 / 11).
+
+## Known limitations / deviations (increment 7)
+- **The 13% R2 figure in the brief is not attributable to the draft WRITE.** It came
+  from comparing two builds (increment 4's DSA-draft decline vs increment 5's
+  device-direct DSA draft) in single runs, on a metric the campaign itself measured
+  as noisy (R2 4G 38,098 vs 32G 45,339 = a 16% swing recorded as "single-run noise",
+  台账 三期). The op-count analysis above is the mechanism this increment removes;
+  the GPU A/B (`SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=1` vs `0`, EAGLE, R1/R2/R3) is
+  what will size it. It is a strict op reduction with identical L3 content, so the
+  downside is bounded at "no measurable change".
+- **Target latent and target indexer are still two ops.** Fusing those as well would
+  halve the op count again even with the draft off, but it would change the draft-off
+  arm too and muddy this A/B. Deliberately left as a follow-up.
+- **SGLang side is py_compile + review + torch-free unit tests only** (no GPU on the
+  dev box), as increments 1-6; the byte-exact claim is proven on the dfkv side
+  against a real cache node.
+- **A pre-existing asymmetry worth knowing** (not introduced or changed here): the
+  draft latent's write rank-skip keys off the DRAFT pool's `sub`, while the draft
+  indexer's keys off the TARGET's `is_mla`. They coincide for every shape currently
+  deployed; a mixed MLA/MHA target-draft pair would write the draft indexer on ranks
+  that skip the draft latent. The increment-7 guard declines fusion for exactly that
+  pair, so it does not make the asymmetry worse.

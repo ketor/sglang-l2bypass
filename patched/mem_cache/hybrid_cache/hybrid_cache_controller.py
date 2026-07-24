@@ -675,7 +675,8 @@ class HybridCacheController(BaseHiCacheController):
             for e in self._sidecar_entries()
         ]
         results = self.storage_backend.batch_get_v2_device(
-            hash_values, device_indices, sidecars
+            hash_values, device_indices, sidecars,
+            with_draft=self.draft_rides_target_batch,
         )
         kv_ok = results.get("kv") or []
         sidecar_oks = [
@@ -742,13 +743,15 @@ class HybridCacheController(BaseHiCacheController):
         indexer sidecar straight into the GPU slots (DEVICE sidecar transfers). Count
         the prefix where the main KV AND every sidecar page hit. No CUDA, no H2D."""
         results = self.storage_backend.batch_get_v2_device(
-            task.hash_values, task.device_indices, task.sidecars
+            task.hash_values, task.device_indices, task.sidecars,
+            with_draft=self.draft_rides_target_batch,
         )
         kv_ok = results.get("kv") or []
         sidecar_oks = [
             results.get(str(e.name)) or [] for e in self._sidecar_entries()
         ]
         # Task 6: best-effort device-direct draft GET into the draft GPU slots.
+        # Inert under increment 7's fusion (the GET above carried the draft).
         self._maybe_device_draft_get(task)
         return consecutive_ok_pages(kv_ok, sidecar_oks, len(task.hash_values))
 
@@ -1009,7 +1012,8 @@ class HybridCacheController(BaseHiCacheController):
             ]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             results = self.storage_backend.batch_set_v2_device(
-                batch_hashes, batch_kv_device, batch_sidecars, extra_info
+                batch_hashes, batch_kv_device, batch_sidecars, extra_info,
+                with_draft=self.draft_rides_target_batch,
             )
             kv_ok = results.get("kv") or []
             if not (len(kv_ok) == n and all(kv_ok)):

@@ -161,6 +161,15 @@ class HiCacheStorage(ABC):
     def supports_device_transfer(self) -> bool:
         return False
 
+    def supports_fused_draft_device(self) -> bool:
+        """Increment 7: True iff the batch_*_v1_device / batch_*_v2_device hooks
+        accept `with_draft=True`, i.e. they can carry the EAGLE draft's sub-keys
+        inside the SAME scatter-gather batch as the target page (the draft rides
+        the target's page hashes and device slots, only the key namespace
+        differs). Default False keeps every backend on the standalone
+        batch_set/get_v1_device_draft round trip."""
+        return False
+
     def register_mem_pool_device(self, mem_pool_device):
         """Register the GPU KV pool's per-layer buffers for RDMA (GPUDirect).
         No-op on backends without device transfer."""
@@ -214,6 +223,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         device_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        with_draft: bool = False,
     ) -> List[bool]:
         """Store pages by RDMA'ing straight from GPU KV slots (no D2H staging).
         Mirrors batch_set_v1 but consumes device page meta."""
@@ -224,6 +234,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         device_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        with_draft: bool = False,
     ) -> List[bool]:
         """Read pages by RDMA'ing straight INTO GPU KV slots (no host staging).
         The read twin of batch_set_v1_device (increment 2). A page succeeds iff all
@@ -237,6 +248,7 @@ class HiCacheStorage(ABC):
         kv_device_indices: torch.Tensor,
         sidecar_transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        with_draft: bool = False,
     ) -> dict[str, List[bool]]:
         """DSA / hybrid L2-bypass backup (increment 2.5): the anchor "kv" pool
         (the big MLA latent) RDMAs straight from its GPU slots to L3 via the
@@ -253,6 +265,7 @@ class HiCacheStorage(ABC):
         kv_device_indices: torch.Tensor,
         sidecar_transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        with_draft: bool = False,
     ) -> dict[str, List[bool]]:
         """DSA / hybrid L2-bypass on-demand read: the read twin of
         batch_set_v2_device. The anchor "kv" pool RDMAs straight INTO its GPU slots
