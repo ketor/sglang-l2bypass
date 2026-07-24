@@ -789,5 +789,106 @@ the increment-2.5 known limitation ("Host-pool allocation NOT eliminated for DSA
   on the dfkv side against a real cache node.
 - **Draft L3 is best-effort.** A DSA draft pool is declined (device-only main latent,
   sidecar unhandled for draft); requires a GPU EAGLE A/B to confirm the acceptance
-  benefit.
+  benefit. **[SUPERSEDED by increment 5 below — DSA draft is now device-direct
+  latent + indexer; the increment-4 "honest decline" was over-conservative.]**
 - **Marker accumulation / gate-#1 device budget** (increments 2/3) unchanged.
+
+---
+
+# Increment 5 — DSA draft indexer sidecar device-direct (lifts the task-6 DSA-draft decline)
+
+One change on top of increments 1/2/2.5/3/4, still guarded by
+`SGLANG_HICACHE_L2_BYPASS=1` (with it off, byte-identical to stock). **No new
+bind-mount files** — the SGLang change lives in the already-mounted
+`managers/cache_controller.py` and `mem_cache/hicache_storage.py`, plus the existing
+dfkv backend mount.
+
+## Why the increment-4 decline was over-conservative
+
+Increment 4 (task 6) enabled EAGLE draft L3 device-direct for a **dense** draft only,
+and declined a DSA draft (`not use_dsa` gate) reasoning "its sidecar isn't handled for
+draft." Ground-truth from the SGLang source resolves the geometry:
+
+- **The GLM-5.2 MTP draft IS a `DSATokenToKVPool`.** For a draft worker,
+  `ModelConfig` rewrites `GlmMoeDsaForCausalLM` → `DeepseekV3ForCausalLMNextN`
+  (`configs/model_config.py`), which `is_deepseek_dsa()` matches (and it inherits
+  `index_topk`), so `model_runner_kv_cache_mixin` builds a `DSATokenToKVPool` for the
+  draft — it DOES carry its own `index_k_with_scale_buffer` indexer sidecar.
+- **A latent-only DSA draft is net-negative, not merely "lower acceptance."** Loading
+  the draft's MLA latent WITHOUT its matching indexer feeds the draft's sparse
+  attention a garbage index → near-zero acceptance on those pages → wasted draft
+  compute. So declining (increment 4) was the right call *given* only the latent was
+  handled — but the fix is to handle the indexer, not to stay declined.
+- The draft indexer has the **identical** layer-first, page-indexed geometry as the
+  target indexer (increment 4's `sidecar_supported` / `get_device_sidecar_page_buffer_meta`
+  are pool-generic and already express it), just with the draft's small `layer_num`.
+  So it device-registers with the exact same machinery.
+
+(Note: stock's own `maybe_register_hicache_draft` builds a plain `MLATokenToKVPoolHost`
+for a DSA draft — DSA subclasses MLA — so **stock never persists the draft indexer
+either**. This increment gives the draft indexer a home that stock never had.)
+
+## Route decision
+
+Device-direct the DSA draft's indexer sidecar alongside its main latent, both under
+distinct `.draft` namespaces (`.draft_k` for the latent, `draft_indexer` for the
+indexer). Gate: for a DSA draft, the backend must expose
+`register_mem_pool_device_draft_sidecar` AND `device_page_meta.sidecar_supported(draft
+pool)` must hold; otherwise **still decline honestly** (a half-loaded DSA draft is
+net-negative). A dense draft is unaffected (latent only, no sidecar registered).
+Best-effort throughout (try/except): a missing/partial draft only lowers EAGLE
+acceptance, never correctness (the target verifies the draft).
+
+### mem_cache/hicache_storage.py (base hook, inert default)
+- `register_mem_pool_device_draft_sidecar(mem_pool_device_draft)` (NEW) → no-op; only
+  the dfkv backend overrides.
+
+### managers/cache_controller.py
+- `_maybe_enable_device_draft` — **lifted the `use_dsa` veto**. Now: gate the draft
+  MAIN latent on `device_page_meta.supported(draft pool)` (unchanged); if the draft is
+  DSA (`use_dsa`), additionally require the backend's draft-sidecar ABI +
+  `sidecar_supported(draft pool)` and register the draft sidecar device pool — else
+  decline honestly (clear log). Dense draft path unchanged. `_draft_device_set` /
+  `_maybe_device_draft_get` are UNCHANGED: the sidecar rides the same
+  `batch_set/get_v1_device_draft` calls (dfkv handles it internally once registered),
+  so no scheduler/collective sequence changed.
+
+### dfkv backend `integration/hicache/dfkv_hicache.py` (branch feat/hicache-device-direct-put)
+- `register_mem_pool_device_draft_sidecar(mem_pool_device_draft)` (NEW) — registers the
+  draft pool's `index_k_with_scale_buffer` regions (GPUDirect MR) under the reused
+  sidecar name `draft_indexer`; sets `_draft_sidecar_name`.
+- `_draft_sidecar_device_set` / `_draft_sidecar_device_get` (NEW) — best-effort wrappers
+  over the shared `_sidecar_device_set/get` for the `draft_indexer` namespace; return
+  None when no draft sidecar is registered (dense draft), `[False]*n` on hard error.
+- `batch_set_v1_device_draft` / `batch_get_v1_device_draft` — after the main-latent SG
+  put/get, also put/get the draft indexer sidecar (when registered) and **AND** the
+  per-page result with the latent result: a page is stored / is a hit only when BOTH
+  the latent and indexer land, so the read never serves a latent without its indexer.
+
+## TP-consistency (unchanged invariant)
+No collective sequence changed. The draft indexer write is TP-replicated (MLA rank-skip,
+via the shared `_sidecar_device_set`'s `is_mla and tp_rank!=0` skip — matching the draft
+latent), the read has no rank skip. The draft GET still runs on the background load
+thread (pure RDMA, no collective).
+
+## Tests
+- dfkv `test/python/test_dfkv_hicache_device_direct.py` (+4, `-k hicache` 95 → 99, all
+  real-cache-node except the two pure-key tests):
+  `test_dsa_draft_device_direct_latent_and_indexer_roundtrip` (DSA draft latent +
+  indexer BOTH device-direct, byte-exact per layer), `test_dsa_draft_indexer_read_miss_
+  is_page_failure` (latent-hit + indexer-miss ⇒ page miss ⇒ recompute),
+  `test_dense_draft_no_sidecar_is_latent_only` (non-DSA draft unchanged, sidecar hooks
+  return None), `test_draft_indexer_keys_distinct_namespace`.
+- SGLang side py_compile + review only (no GPU on the dev box), as increments 1-4.
+
+## Known limitations / deviations (increment 5)
+- **SGLang-side verified by py_compile + review + the dfkv-side byte-exact roundtrip**
+  (no GPU / GLM-5.2 in the dev box). The load-bearing correctness claim — the draft
+  latent + indexer reassemble byte-exact under distinct keys — IS proven on the dfkv
+  side against a real cache node. The end-to-end EAGLE-acceptance win needs a GPU A/B
+  (EAGLE R3 with DSA draft-L3 on vs off).
+- **Still honest-declines** when the draft sidecar geometry is not device-expressible
+  or the backend lacks the draft-sidecar ABI (a half-loaded DSA draft would corrupt the
+  draft indexer). No faking.
+- **Draft indexer host residual = 0.** Like the target sidecar (task 4), the draft
+  indexer rides its GPU buffer device-direct; no draft host staging is allocated.

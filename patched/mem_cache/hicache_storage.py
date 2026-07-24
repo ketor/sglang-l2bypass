@@ -178,6 +178,16 @@ class HiCacheStorage(ABC):
         without device transfer; only device-direct backends override."""
         pass
 
+    def register_mem_pool_device_draft_sidecar(self, mem_pool_device_draft):
+        """DSA-draft extension of task 6: register the draft model's DSA indexer
+        sidecar (index_k_with_scale_buffer) GPU buffers for RDMA (GPUDirect), so a
+        DSA draft's indexer rides the device-direct path alongside its main latent —
+        the draft KV is then coherent (latent + indexer) on an L3 hit rather than a
+        latent-only half page. No-op on backends without device transfer; only
+        device-direct backends override. Enabled only for a DSA draft whose sidecar
+        is device-expressible; a non-DSA draft never calls this."""
+        pass
+
     def batch_set_v1_device_draft(
         self,
         keys: List[str],

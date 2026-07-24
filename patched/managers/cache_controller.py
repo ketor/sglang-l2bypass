@@ -1267,11 +1267,23 @@ class HiCacheController:
         draft KV is RDMA'd straight from/into the draft GPU pool's slots (the same
         slots the target rode). Enabled only if: bypass is on, a draft is registered,
         the backend exposes the device-draft ABI (register_mem_pool_device_draft +
-        batch_set/get_v1_device_draft), AND the draft GPU pool is a plain MLA/MHA
-        expressible as device page meta. A DSA draft (indexer sidecar) is declined —
-        its sidecar is not handled here, and loading an incomplete draft KV would
-        just lower acceptance; we keep it honest by leaving draft L3 off. Best-effort:
-        any miss logs once and leaves draft L3 disabled (recompute-safe)."""
+        batch_set/get_v1_device_draft), AND the draft GPU pool's MAIN latent is a
+        device-SG-expressible MLA/MHA.
+
+        DSA DRAFT (GLM-5.2): a DSA draft is a DSATokenToKVPool — its main latent IS a
+        real MLA latent (device-expressible) but it ALSO carries an indexer sidecar
+        (index_k_with_scale_buffer). The original task-6 gate declined it outright
+        (`use_dsa` veto) because loading the latent WITHOUT the matching indexer would
+        give the draft's sparse attention a garbage index → worse acceptance than
+        recompute. We now lift that veto: the draft's indexer is the SAME layer-first,
+        page-indexed shape as the target's (increment 4), so we device-register it too
+        and the draft KV is coherent (latent + indexer) on an L3 hit. The gate is:
+        for a DSA draft, the backend must expose register_mem_pool_device_draft_sidecar
+        AND device_page_meta.sidecar_supported(draft pool) must hold; if either is
+        missing we DECLINE honestly (leave draft L3 off) rather than serve a half page.
+        A dense (non-DSA) draft is unaffected — latent only, no sidecar.
+
+        Best-effort: any miss logs once and leaves draft L3 disabled (recompute-safe)."""
         self.draft_device_enabled = False
         if not (self.l2_bypass and self.has_draft and self.enable_storage):
             return
@@ -1287,16 +1299,28 @@ class HiCacheController:
             return
         from sglang.srt.mem_cache import device_page_meta
 
-        if not device_page_meta.supported(self.mem_pool_device_draft) or getattr(
-            self.mem_pool_device_draft, "use_dsa", False
+        draft_pool = self.mem_pool_device_draft
+        if not device_page_meta.supported(draft_pool):
+            logger.info(
+                "HiCache draft L3 stays OFF under L2-bypass: draft GPU pool %r main "
+                "latent is not device-SG-expressible.", type(draft_pool).__name__)
+            return
+        # DSA draft: the indexer sidecar must also be device-registrable, else decline.
+        draft_is_dsa = bool(getattr(draft_pool, "use_dsa", False))
+        if draft_is_dsa and not (
+            callable(getattr(backend, "register_mem_pool_device_draft_sidecar", None))
+            and device_page_meta.sidecar_supported(draft_pool)
         ):
             logger.info(
-                "HiCache draft L3 stays OFF under L2-bypass: draft GPU pool %r is not "
-                "a plain device-SG-expressible MLA/MHA (DSA draft sidecar unhandled).",
-                type(self.mem_pool_device_draft).__name__)
+                "HiCache draft L3 stays OFF under L2-bypass: DSA draft pool %r has an "
+                "indexer sidecar that this backend/geometry cannot device-register "
+                "(a latent-only DSA draft would corrupt the draft indexer — declining "
+                "is the honest choice).", type(draft_pool).__name__)
             return
         try:
-            backend.register_mem_pool_device_draft(self.mem_pool_device_draft)
+            backend.register_mem_pool_device_draft(draft_pool)
+            if draft_is_dsa:
+                backend.register_mem_pool_device_draft_sidecar(draft_pool)
         except Exception:
             logger.exception(
                 "Failed to register draft GPU pool for device-direct draft L3; "
@@ -1305,7 +1329,8 @@ class HiCacheController:
         self.draft_device_enabled = True
         logger.info(
             "HiCache draft L3 ENABLED under L2-bypass: draft KV RDMAs device-direct "
-            "(best-effort) alongside the target. Backend=%r.",
+            "(best-effort) alongside the target%s. Backend=%r.",
+            " (DSA: latent + indexer sidecar)" if draft_is_dsa else "",
             self.storage_backend_type)
 
     def _draft_device_set(self, hash_values, device_indices) -> None:
