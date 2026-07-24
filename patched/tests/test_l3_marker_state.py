@@ -30,6 +30,7 @@ from mem_cache.l3_marker_state import (  # noqa: E402
     climb_evicted_chain,
     collect_loadable_chain,
     node_l3_resident,
+    plan_promotion,
     prune_l3_markers,
 )
 
@@ -370,6 +371,111 @@ class TestCollectLoadableChain(unittest.TestCase):
         self.assertEqual([n.id for n in nodes], [a.id, b.id])
         self.assertIs(ancestor, root)
         self.assertEqual(gaps, [])
+
+
+class TestPlanPromotion(unittest.TestCase):
+    """Publishing a completed device-direct load. The load-bearing case is
+    CONCURRENT requests over one prefix: two requests can collect the same marker
+    chain (the second one's chain is the first one's plus its own suffix), so by
+    the time our GET lands the nodes may already carry another request's slots."""
+
+    def chain(self, lengths):
+        root = make_root()
+        parent = device_node([0, 0], root)
+        nodes = []
+        for i, n_pages in enumerate(lengths):
+            parent = marker(list(range(100 + i * 10, 100 + i * 10 + n_pages * PAGE)), parent)
+            nodes.append(parent)
+        return nodes
+
+    def test_all_verified_assigns_whole_chain(self):
+        nodes = self.chain([1, 1, 1])
+        plan = plan_promotion(nodes, verified_tokens=6)
+        self.assertEqual([n.id for n, _, _ in plan.assign], [n.id for n in nodes])
+        self.assertEqual([(s, e) for _, s, e in plan.assign], [(0, 2), (2, 4), (4, 6)])
+        self.assertEqual(plan.tokens, 6)
+        self.assertEqual(plan.drop_from, 3)
+        self.assertFalse(plan.superseded)
+
+    def test_partial_verify_marks_the_tail_for_drop(self):
+        nodes = self.chain([1, 1, 1])
+        plan = plan_promotion(nodes, verified_tokens=4)
+        self.assertEqual(len(plan.assign), 2)
+        self.assertEqual(plan.tokens, 4)
+        self.assertEqual(plan.drop_from, 2, "the unverified tail starts at index 2")
+        self.assertFalse(plan.superseded)
+
+    def test_node_not_fully_covered_is_not_assigned(self):
+        # A node spanning 2 pages with only 1 page verified must not be published.
+        nodes = self.chain([2, 1])
+        plan = plan_promotion(nodes, verified_tokens=2)
+        self.assertEqual(plan.assign, [])
+        self.assertEqual(plan.tokens, 0)
+        self.assertEqual(plan.drop_from, 0)
+
+    def test_supersede_stops_at_the_node_another_request_published(self):
+        nodes = self.chain([1, 1, 1])
+        nodes[1].value = ["someone", "else"]  # promoted while our GET was in flight
+        plan = plan_promotion(nodes, verified_tokens=6)
+        self.assertEqual([n.id for n, _, _ in plan.assign], [nodes[0].id])
+        self.assertEqual(plan.tokens, 2)
+        self.assertTrue(plan.superseded)
+        self.assertEqual(
+            plan.drop_from,
+            3,
+            "everything inside the verified prefix stays claimed — the drop "
+            "boundary follows verification, not the supersede break",
+        )
+
+    def test_fully_superseded_load_publishes_nothing(self):
+        # The whole chain was published by a concurrent request: we publish
+        # nothing, so no fence/ack/lock is registered for a node id that already
+        # has one (that mismatch is what leaves a stuck lock_ref).
+        nodes = self.chain([1, 1])
+        for n in nodes:
+            n.value = ["someone", "else"]
+        plan = plan_promotion(nodes, verified_tokens=4)
+        self.assertEqual(plan.assign, [])
+        self.assertEqual(plan.tokens, 0)
+        self.assertTrue(plan.superseded)
+        self.assertEqual(plan.drop_from, 2, "both nodes were verified; drop none")
+
+    def test_superseded_node_keeps_its_slots(self):
+        nodes = self.chain([1, 1])
+        theirs = ["their", "slots"]
+        nodes[0].value = theirs
+        plan = plan_promotion(nodes, verified_tokens=4)
+        self.assertEqual(plan.assign, [])
+        self.assertIs(nodes[0].value, theirs, "must never overwrite live slots")
+
+    def test_evicted_node_after_a_supersede_is_neither_published_nor_dropped(self):
+        # We stop publishing at the supersede point, so a still-evicted node
+        # behind it keeps its marker for a later load — it must not be dropped
+        # (its pages verified) and must not be published (our buffer prefix
+        # would no longer be contiguous with what we free).
+        nodes = self.chain([1, 1, 1])
+        nodes[1].value = ["someone", "else"]
+        plan = plan_promotion(nodes, verified_tokens=6)
+        self.assertEqual([n.id for n, _, _ in plan.assign], [nodes[0].id])
+        self.assertTrue(nodes[2].evicted)
+        self.assertTrue(node_l3_resident(nodes[2]))
+        self.assertEqual(plan.drop_from, 3)
+
+    def test_zero_verified_assigns_nothing(self):
+        nodes = self.chain([1, 1])
+        plan = plan_promotion(nodes, verified_tokens=0)
+        self.assertEqual(plan.assign, [])
+        self.assertEqual(plan.drop_from, 0)
+        self.assertFalse(plan.superseded)
+
+    def test_assigned_spans_are_contiguous_from_zero(self):
+        nodes = self.chain([2, 3, 1])
+        plan = plan_promotion(nodes, verified_tokens=12)
+        expected_end = 0
+        for _, start, end in plan.assign:
+            self.assertEqual(start, expected_end)
+            expected_end = end
+        self.assertEqual(plan.tokens, expected_end)
 
 
 class TestDropThenMatchEndToEnd(unittest.TestCase):

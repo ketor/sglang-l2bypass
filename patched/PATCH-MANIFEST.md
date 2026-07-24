@@ -1318,6 +1318,45 @@ most siblings.
   backuped, which makes its parent backuped, so the parent takes
   `_evict_backuped`.
 
+## The concurrency half: two requests loading one chain
+
+The lead's reproduction narrowed it further — **concurrent** warmup (mixed
+lengths, 4-way parallel) crashes every time, **serial** warmup never does. That
+is the mechanism above, sharpened: with requests in flight simultaneously over a
+shared prefix, one request's deeper markers are *children* of another's chain, so
+a drop by any of them strands the shared ancestors. Serially, a chain is a clean
+leaf chain and detaches without residue — which is exactly why v1 never
+reproduced.
+
+The same overlap has a second consequence — ⚠️ **inferred from code reading, NOT
+observed**: the crash-era logs were lost when the container was rebuilt on the
+fixed build, so this one is neither confirmed nor refuted by evidence (the
+`match_prefix` assert above IS evidenced, 16 occurrences). It is fixed here
+because the reasoning holds and the fix is cheap, not because it was seen.
+
+`_start_l3_async_load` collects the chain by climbing from the deepest matched
+node, so request 2's chain **contains request 1's still-in-flight markers**, and
+a request whose match lands on in-flight markers takes the SYNC fallback
+(`schedule_policy.py:1105` → `init_load_back` → `load_from_storage_device`) over
+the very same nodes. When both loads land:
+
+- the later one **overwrites `n.value`**, orphaning the slots the tree (and the
+  other request) is already using — a device-memory bleed that can only appear
+  under concurrency, and
+- both register `ongoing_load_back[same node id]`, while `loading_check:1171`
+  does `self.ongoing_load_back.pop(ack_id)` **once per ack** — so the second ack
+  would pop a missing key (`KeyError`, scheduler down) or, at best, leave an
+  unmatched `inc_lock_ref` pinning the node forever.
+
+Fix: `l3_marker_state.plan_promotion` + `_apply_promotion` publish only nodes
+that are **still evicted**. A node already carrying slots means a concurrent
+request (or a recompute + `insert()`) published it first; the tree's slots win,
+ours are freed, and publishing stops there so the freed remainder stays a
+contiguous suffix of the buffer. If nothing is left to publish, no fence, no ack
+and no lock are registered — which is precisely the case that would otherwise
+double-register. Markers inside the verified prefix are never dropped by the
+supersede break (the drop boundary follows verification, not publication).
+
 ## Safety: a gap can only shrink a match, never fake a hit
 
 The verification of KV content is unchanged and stays where it was — at load
@@ -1344,27 +1383,36 @@ pre-existing `if not nodes_to_load:` early return already assumed.
 ## Changed files / functions
 
 - `mem_cache/l3_marker_state.py` — **NEW**: `node_l3_backed/_present/_resident`,
-  `climb_evicted_chain`, `collect_loadable_chain`, `prune_l3_markers`.
+  `climb_evicted_chain`, `collect_loadable_chain`, `plan_promotion`,
+  `prune_l3_markers`.
 - `mem_cache/hiradix_cache.py` — `match_prefix` (assert → gap-tolerant climb),
   `_drop_l3_markers` (delegates to `prune_l3_markers` + in-flight set),
   `load_from_storage_device` / `_start_l3_async_load` (chain walk → 
-  `collect_loadable_chain`, asserts gone), `_evict_write_through` (bypass
+  `collect_loadable_chain`, asserts gone), `_promote_l3_async_load` /
+  `load_from_storage_device` publish via `plan_promotion` + `_apply_promotion`
+  (never clobber a concurrently published node), `_evict_write_through` (bypass
   children guard), `_log_l3_gap` + `_l3_gap_count` (new), `_node_l3_*` (thin
   delegates).
 
 ## Tests
 
-`patched/tests/test_l3_marker_state.py` (NEW, 23 tests, torch-free): the drop
+`patched/tests/test_l3_marker_state.py` (NEW, 32 tests, torch-free): the drop
 paths (childless / sibling branch / device-resident / in-flight / already
 detached / l3_backed+present / partial-suffix) each asserted to leave **no gap in
 the tree**; the climb with gaps at the top level, directly under the device
 prefix, mid-chain and doubled; `collect_loadable_chain` discarding below a gap
 and treating a hash-less marker as a gap; flag-off equivalence on a host-backed
 chain; and the end-to-end production sequence (discover → sibling → failed drop →
-later match). The pre-fix logic run against the same fake tree reproduces
-`evicted non-backuped node 2 outside L2-bypass` verbatim.
+later match); plus `plan_promotion` — full/partial verify, a node only partly
+covered by the verified prefix, and the concurrency cases (supersede mid-chain,
+fully superseded, superseded node keeps ITS slots, an evicted node behind a
+supersede is neither published nor dropped). The pre-fix logic run against the
+same fake tree reproduces `evicted non-backuped node 2 outside L2-bypass`
+verbatim.
 
 `py_compile` clean; increments 3/4/6/7 suites still pass (13 / 9 / 21 / 9).
+Reproduction to re-run after the fix: `warmup.sh` v2 (concurrent, mixed lengths)
+— the serial v1 never triggered any of this.
 
 ## Known limitations (increment 7.1)
 

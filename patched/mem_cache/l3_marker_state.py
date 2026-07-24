@@ -41,6 +41,8 @@ __all__ = [
     "ClimbResult",
     "climb_evicted_chain",
     "collect_loadable_chain",
+    "PromotionPlan",
+    "plan_promotion",
     "prune_l3_markers",
 ]
 
@@ -140,6 +142,58 @@ def collect_loadable_chain(
             nodes_to_load.clear()
         node = node.parent
     return nodes_to_load, node, gap_nodes
+
+
+class PromotionPlan(NamedTuple):
+    assign: List[Tuple[Any, int, int]]  # (node, start, end) offsets into the load
+    tokens: int  # total tokens assigned == end of the last span
+    drop_from: int  # index into nodes_to_load of the first unverified marker
+    superseded: bool  # stopped early because a node was already device-resident
+
+
+def plan_promotion(nodes_to_load: Sequence[Any], verified_tokens: int) -> PromotionPlan:
+    """Decide which nodes of a completed device-direct load become device-resident.
+
+    Two independent stop conditions, both of which leave the assigned span a
+    contiguous prefix of the loaded buffer:
+
+    * ``verified_tokens`` — the cross-rank MIN of verified pages. Nodes past it
+      were not verified on every rank; ``drop_from`` marks where their markers
+      start so the caller drops them and the tail recomputes.
+    * **superseded** — the node already has device slots, i.e. a CONCURRENT
+      request loaded (or recomputed and re-inserted) the same pages while our GET
+      was in flight. The tree's slots win; ours are duplicates and the caller
+      frees them. Overwriting instead would orphan the slots the tree (and the
+      other request) is already using, and would register a second load-back ack
+      for the same node id — which `loading_check` pops once, leaving a stuck
+      lock_ref. Markers at or past the supersede point are NOT dropped: they are
+      valid (resident or still claimed), just not ours to publish.
+    """
+    assign: List[Tuple[Any, int, int]] = []
+    published = 0  # tokens we publish — a contiguous prefix of the buffer
+    scanned = 0  # tokens covered by the cross-rank verified prefix
+    verified_nodes = 0
+    superseded = False
+    publishing = True
+
+    for n in nodes_to_load:
+        n_len = len(n.key)
+        if scanned + n_len > verified_tokens:
+            break
+        verified_nodes += 1
+        scanned += n_len
+        if not publishing:
+            # Past the supersede point: verified (so not dropped), but not ours
+            # to publish. Its marker stays and a later load can pick it up.
+            continue
+        if n.value is not None:
+            superseded = True
+            publishing = False
+            continue
+        assign.append((n, published, published + n_len))
+        published += n_len
+
+    return PromotionPlan(assign, published, verified_nodes, superseded)
 
 
 def prune_l3_markers(

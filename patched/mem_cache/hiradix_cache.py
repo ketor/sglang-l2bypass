@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.l3_marker_state import (
     node_l3_backed,
     node_l3_present,
     node_l3_resident,
+    plan_promotion,
     prune_l3_markers,
 )
 from sglang.srt.mem_cache.memory_pool import (
@@ -1649,27 +1650,14 @@ class HiRadixCache(RadixCache):
 
         # Assign device slots to the verified prefix nodes; the failed suffix is
         # dropped and recomputes.
-        offset = 0
-        loaded_nodes: List[TreeNode] = []
-        for n in nodes_to_load:
-            n_len = len(n.key)
-            if offset + n_len <= verified_tokens:
-                n.value = device_indices[offset : offset + n_len].clone()
-                n.l3_present = False  # now device-resident
-                # Read-hit => the page is IN L3; mark l3_backed so _inc_hit_count's
-                # already-backed gate skips the redundant post-read PUT (task 2).
-                n.l3_backed = True
-                self._record_store_event(n, medium=StorageMedium.GPU)
-                loaded_nodes.append(n)
-                offset += n_len
-            else:
-                break
+        plan = plan_promotion(nodes_to_load, verified_tokens)
+        offset = self._apply_promotion(plan, device_indices)
 
         # Free the unverified suffix's slots, drop its markers.
         if offset < len(device_indices):
             self.cache_controller.free_device_indices(device_indices[offset:])
-        if len(loaded_nodes) < len(nodes_to_load):
-            dropped = nodes_to_load[len(loaded_nodes) :]
+        if plan.drop_from < len(nodes_to_load):
+            dropped = nodes_to_load[plan.drop_from :]
             self._drop_l3_markers(dropped)
             logger.warning(
                 "load_from_storage_device: partial verify (%d/%d pages) for node "
@@ -1680,10 +1668,16 @@ class HiRadixCache(RadixCache):
                 len(dropped),
             )
 
+        if not plan.assign:
+            # Every verified page was already device-resident (a concurrent
+            # request published it first). Our slots were freed just above and the
+            # ancestor pin was already released after the MIN — nothing to publish.
+            return None
+
         self.evictable_size_ += offset
         loaded_indices = device_indices[:offset]
 
-        last_loaded = loaded_nodes[-1]
+        last_loaded = plan.assign[-1][0]
         # inc_lock_ref(last_loaded) pins the whole chain up to root (all loaded
         # nodes are ancestors of last_loaded), and loading_check dec_lock_refs it
         # once — so only last_loaded is tracked in ongoing_load_back, matching the
@@ -2106,28 +2100,14 @@ class HiRadixCache(RadixCache):
         self.cache_controller.finalize_device_load(task, min_pages)
 
         device_indices = task.device_indices
-        offset = 0
-        loaded_nodes: List[TreeNode] = []
-        for n in nodes_to_load:
-            n_len = len(n.key)
-            if offset + n_len <= verified_tokens:
-                n.value = device_indices[offset : offset + n_len].clone()
-                n.l3_present = False  # now device-resident
-                # Read-hit => the page is IN L3 (we just read it), so mark it
-                # l3_backed: _inc_hit_count's already-backed gate then skips the
-                # redundant write-through/backup PUT after this read (task 2).
-                n.l3_backed = True
-                self._record_store_event(n, medium=StorageMedium.GPU)
-                loaded_nodes.append(n)
-                offset += n_len
-            else:
-                break
+        plan = plan_promotion(nodes_to_load, verified_tokens)
+        offset = self._apply_promotion(plan, device_indices)
 
         # Free the unverified suffix's slots; drop its markers so the tail recomputes.
         if offset < len(device_indices):
             self.cache_controller.free_device_indices(device_indices[offset:])
-        if len(loaded_nodes) < len(nodes_to_load):
-            dropped = nodes_to_load[len(loaded_nodes) :]
+        if plan.drop_from < len(nodes_to_load):
+            dropped = nodes_to_load[plan.drop_from :]
             self._drop_l3_markers(dropped)
             logger.warning(
                 "async l3 load: partial verify (%d/%d pages) for req %s; dropped %d "
@@ -2137,9 +2117,27 @@ class HiRadixCache(RadixCache):
                 req_id,
                 len(dropped),
             )
+        if plan.superseded:
+            # Concurrent requests over one prefix: another request's load (or a
+            # recompute + insert) published these pages while our GET was in
+            # flight. Its slots are the tree's; ours were freed above.
+            logger.debug(
+                "async l3 load: req %s superseded at node %d (%d/%d nodes ours)",
+                req_id,
+                nodes_to_load[len(plan.assign)].id,
+                len(plan.assign),
+                len(nodes_to_load),
+            )
+
+        if not plan.assign:
+            # Nothing of ours to publish: no fence, no ack, no lock. Registering
+            # a second ack for a node another request already registered would
+            # leave loading_check popping one entry for two dec_lock_refs.
+            self.dec_lock_ref(ancestor)
+            return True
 
         self.evictable_size_ += offset
-        last_loaded = loaded_nodes[-1]
+        last_loaded = plan.assign[-1][0]
         # inc_lock_ref(last_loaded) pins the whole loaded chain up to root; the
         # stock loading_check dec_lock_refs it once when the fence event fires.
         self.ongoing_load_back[last_loaded.id] = last_loaded
@@ -2472,6 +2470,19 @@ class HiRadixCache(RadixCache):
         detached, _kept = prune_l3_markers(nodes, self.page_size, in_flight)
         for n in detached:
             self._update_leaf_status(n.parent)
+
+    def _apply_promotion(self, plan, device_indices: torch.Tensor) -> int:
+        """Publish a completed device-direct load: the planned span of each node
+        becomes its device value. Returns the number of tokens published (the
+        caller frees the rest of the buffer). Read-hit => the page IS in L3, so
+        mark l3_backed as well: _inc_hit_count's already-backed gate then skips
+        the redundant post-read PUT."""
+        for node, start, end in plan.assign:
+            node.value = device_indices[start:end].clone()
+            node.l3_present = False  # now device-resident
+            node.l3_backed = True
+            self._record_store_event(node, medium=StorageMedium.GPU)
+        return plan.tokens
 
     def _log_l3_gap(self, gap_nodes: List[TreeNode]) -> None:
         """A walk hit an evicted node with neither a host copy nor an L3 claim.
