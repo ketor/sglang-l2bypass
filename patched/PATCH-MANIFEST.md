@@ -36,6 +36,7 @@ read-only over the matching site-packages file):
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hiradix_cache.py:$SGLANG/srt/mem_cache/hiradix_cache.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hicache_storage.py:$SGLANG/srt/mem_cache/hicache_storage.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_page_meta.py:$SGLANG/srt/mem_cache/device_page_meta.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/l3_marker_state.py:$SGLANG/srt/mem_cache/l3_marker_state.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/managers/cache_controller.py:$SGLANG/srt/managers/cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hybrid_cache/hybrid_cache_controller.py:$SGLANG/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/pool_host/base.py:$SGLANG/srt/mem_cache/pool_host/base.py:ro
@@ -1245,3 +1246,135 @@ files; increments 3/4/6 unit tests still pass (13 / 9 / 11).
   deployed; a mixed MLA/MHA target-draft pair would write the draft indexer on ranks
   that skip the draft latent. The increment-7 guard declines fusion for exactly that
   pair, so it does not make the asymmetry worse.
+
+---
+
+# Increment 7.1 (hotfix) — the L3 marker state machine has no gaps
+
+**Crash it fixes** (100k×16 C8, GLM-5.2 DSA + EAGLE + bypass, HICACHE=4, after
+several restart→warmup→bench cycles; 8/8 ranks down, instance DOWN):
+
+```
+mem_cache/hiradix_cache.py, match_prefix
+    assert self.l2_bypass and self._node_l3_resident(last_node), (
+AssertionError: evicted non-backuped node 2 outside L2-bypass
+```
+
+## 🔴 New bind-mount file
+
+`mem_cache/l3_marker_state.py` is NEW (torch-free, unit-tested; same treatment as
+`device_page_meta.py`). **`hiradix_cache.py` imports it — mount it or the server
+will not start.** The line is already in the bind-mount block at the top.
+
+## Root cause (one function)
+
+`_drop_l3_markers` cleared `l3_present` **unconditionally** but only detached the
+node when it was childless:
+
+```python
+for n in reversed(nodes):
+    n.l3_present = False                      # <-- always
+    if n.value is None and len(n.children) == 0 and n.parent is not None:
+        ...detach...                          # <-- only sometimes
+```
+
+A marker that had acquired a child — another request discovering a different
+suffix under the same shared prefix inserts a SIBLING under it
+(`_insert_helper_l3`) — therefore stayed in the tree with `value=None`,
+`host_value=None`, `l3_present=False`, `l3_backed=False`. That is a **gap**: an
+evicted node whose KV is nowhere. The bypass tree's invariant is "an evicted
+in-tree node is backuped or L3-resident", and `match_prefix`'s climb asserted it.
+Any later request matching *through* the gap (its descendants are live markers,
+so this is the common case) crashed the scheduler.
+
+Why only after several bench cycles: it needs (a) a warm L3 so discovery
+materializes markers at all, (b) a branched tree — the 16 prompts must have split
+the shared prefix into sibling branches, which only exists after the first pass,
+and (c) one marker-drop event (0-verified / partial-verify / alloc-fail /
+abort). Node id 2 in the traceback is the top-level shared-prefix marker, i.e.
+the first node the first discovery created — which is exactly the node with the
+most siblings.
+
+## Fix
+
+- **Root cause** — `l3_marker_state.prune_l3_markers` never leaves a gap. A
+  marker that cannot be detached (has children) **keeps its L3 claim**; a marker
+  another request's GET still owns (`in_flight_ids`, derived from
+  `_bypass_load_state`) is left alone too — detaching it would have that load
+  promote a node no longer in the tree and leak its GPU slots. Only nodes that
+  are genuinely removable are cleared and popped.
+- **Bounded fallback** (production must not die on cache metadata) — the assert
+  is gone. `climb_evicted_chain` treats a gap as a hard **miss boundary**: the
+  hit length restarts above it and the load-back start node moves above it. The
+  same rule in `collect_loadable_chain` (both the sync `load_from_storage_device`
+  and the async `_start_l3_async_load` chain walks, which had the same assert):
+  hitting a gap discards everything collected below it. Gaps are counted
+  (`_l3_gap_count`) and logged throttled (first, then every 100th).
+- **Eviction** — `_evict_write_through` now skips a bypass device leaf that still
+  has children. "Device leaf" means *all children evicted*, and in bypass those
+  children are L3 markers still in the tree, so `_evict_regular` (which asserts
+  leafness and deletes the node) would have been a second crash / an orphaned
+  marker subtree. Unreachable with the flag off: a stock evicted child is
+  backuped, which makes its parent backuped, so the parent takes
+  `_evict_backuped`.
+
+## Safety: a gap can only shrink a match, never fake a hit
+
+The verification of KV content is unchanged and stays where it was — at load
+time (`consecutive_ok_pages` per page + the cross-rank MIN in
+`_promote_l3_async_load` / `load_from_storage_device`). Markers were never
+evidence of content, only a claim, so keeping a claim on an undetachable node
+cannot make a page be served: the next load re-verifies it and, if it really is
+gone, drops it again (detaching it that time, once the children are gone) and the
+tokens recompute. In the other direction, every gap branch only ever REMOVES
+nodes from the hit (`host_hit_length` restarts at 0 above the gap;
+`nodes_to_load.clear()`), and `host_hit_length` is a scheduling budget hint
+(`schedule_policy.py:1043`), so under-reporting is always safe. Nothing new is
+marked device-resident anywhere in this change.
+
+## TP-consistency (unchanged invariant)
+
+No collective added, removed or reordered. The new early return in
+`load_from_storage_device` (empty chain) and the gap branches are decided purely
+from tree state, and the tree is TP-symmetric: every marker drop comes from a
+POST-MIN decision (alloc MIN, verified-pages MIN) or from an abort, which is
+broadcast to all ranks. So all ranks take the same branch, exactly as the
+pre-existing `if not nodes_to_load:` early return already assumed.
+
+## Changed files / functions
+
+- `mem_cache/l3_marker_state.py` — **NEW**: `node_l3_backed/_present/_resident`,
+  `climb_evicted_chain`, `collect_loadable_chain`, `prune_l3_markers`.
+- `mem_cache/hiradix_cache.py` — `match_prefix` (assert → gap-tolerant climb),
+  `_drop_l3_markers` (delegates to `prune_l3_markers` + in-flight set),
+  `load_from_storage_device` / `_start_l3_async_load` (chain walk → 
+  `collect_loadable_chain`, asserts gone), `_evict_write_through` (bypass
+  children guard), `_log_l3_gap` + `_l3_gap_count` (new), `_node_l3_*` (thin
+  delegates).
+
+## Tests
+
+`patched/tests/test_l3_marker_state.py` (NEW, 23 tests, torch-free): the drop
+paths (childless / sibling branch / device-resident / in-flight / already
+detached / l3_backed+present / partial-suffix) each asserted to leave **no gap in
+the tree**; the climb with gaps at the top level, directly under the device
+prefix, mid-chain and doubled; `collect_loadable_chain` discarding below a gap
+and treating a hash-less marker as a gap; flag-off equivalence on a host-backed
+chain; and the end-to-end production sequence (discover → sibling → failed drop →
+later match). The pre-fix logic run against the same fake tree reproduces
+`evicted non-backuped node 2 outside L2-bypass` verbatim.
+
+`py_compile` clean; increments 3/4/6/7 suites still pass (13 / 9 / 21 / 9).
+
+## Known limitations (increment 7.1)
+
+- A kept claim on an undetachable marker costs one futile SG GET per request
+  until a recompute rehydrates the node (`insert()` refills evicted nodes it
+  walks through, which also re-marks it `l3_backed` on write-through). Bounded
+  and self-healing, and it only happens when the page truly left L3.
+- `_evict_write_through`'s skip can under-evict when many device leaves carry
+  marker children. It returns fewer tokens; the caller retries/retracts as it
+  already does. Never observed to matter at HICACHE=4 (markers resolve within a
+  round or two), but it is the reason `_l3_gap_count` is worth watching.
+- Not GPU-verified on this box (no torch) — same standing caveat as increments
+  1-7.

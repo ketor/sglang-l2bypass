@@ -41,6 +41,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_dsa_pool_to_hiradix_cache,
 )
+from sglang.srt.mem_cache.l3_marker_state import (
+    climb_evicted_chain,
+    collect_loadable_chain,
+    node_l3_backed,
+    node_l3_present,
+    node_l3_resident,
+    prune_l3_markers,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
@@ -236,6 +244,11 @@ class HiRadixCache(RadixCache):
         # scheduler parks the request in the waiting queue until every rank's local
         # GET has landed. Empty and inert unless async L2-bypass read is on.
         self._bypass_load_state: Dict[str, _BypassLoadState] = {}
+        # L2-bypass: number of times a match/load walk hit a GAP node (evicted,
+        # no host copy, no L3 claim). Such a node is served as a MISS; the count
+        # is the health signal for the marker state machine (steady growth means
+        # markers are being stranded somewhere).
+        self._l3_gap_count = 0
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -865,27 +878,17 @@ class HiRadixCache(RadixCache):
         l2_bypass."""
         return getattr(self.cache_controller, "l2_bypass_sync_read", False)
 
+    # The node-level L3 state predicates live in mem_cache/l3_marker_state.py
+    # (torch-free, unit-tested); these stay as thin methods so the call sites read
+    # the same as before.
     def _node_l3_backed(self, node: TreeNode) -> bool:
-        """L2-bypass analogue of node.backuped: the node's KV has been handed to
-        the device->L3 write-through. Tracked on a dynamic attribute so the stock
-        TreeNode (radix_cache.py) is untouched; defaults False for stock nodes."""
-        return getattr(node, "l3_backed", False)
+        return node_l3_backed(node)
 
     def _node_l3_present(self, node: TreeNode) -> bool:
-        """L2-bypass (increment 2) read-side marker: this node's KV was DISCOVERED
-        in L3 via an exist query (batch_exists) but is not device-resident here yet
-        — it has hash_value and l3_present=True, but no value and no host_value. On
-        a successful device-direct load the flag clears (node becomes device-
-        resident). Distinct from l3_backed (which means THIS instance wrote it)."""
-        return getattr(node, "l3_present", False)
+        return node_l3_present(node)
 
     def _node_l3_resident(self, node: TreeNode) -> bool:
-        """True if node's KV is retrievable from L3 by hash — either this instance
-        wrote it (l3_backed) or it was discovered via exist (l3_present). Both are
-        loadable device-direct; match_prefix climbs them and load_from_storage_device
-        reads them. (A node can be both after a self-written page is evicted then
-        re-discovered.)"""
-        return self._node_l3_backed(node) or self._node_l3_present(node)
+        return node_l3_resident(node)
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
         if self.l2_bypass:
@@ -1270,12 +1273,23 @@ class HiRadixCache(RadixCache):
         """
         heap = self._make_eviction_heap()
         num_evicted = 0
+        l2_bypass = self.l2_bypass
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x.lock_ref > 0:
                 continue
             if x.backuped:
                 num_evicted += self._evict_backuped(x)
+            elif l2_bypass and x.children:
+                # L2-bypass: a device leaf here means "all children evicted", and
+                # in bypass those children are L3 markers, still in the tree.
+                # _evict_regular deletes the node outright (it asserts leafness),
+                # which would orphan the marker subtree — skip it. The node becomes
+                # evictable again once its markers load (device-resident child) or
+                # are pruned. Unreachable with the flag off: a stock evicted child
+                # is backuped, which makes its parent backuped too (contiguous
+                # backup prefix), so the parent takes the _evict_backuped branch.
+                continue
             else:
                 num_evicted += self._evict_regular(x)
             self._promote_parent(x, heap)
@@ -1558,17 +1572,16 @@ class HiRadixCache(RadixCache):
         if nothing was verified across all ranks."""
         start_time = time.perf_counter()
         last_hit_node = node
-        nodes_to_load = []
-        while node.evicted:
-            assert self._node_l3_resident(node), (
-                f"evicted non-L3 node {node.id} in bypass load_from_storage_device"
-            )
-            assert node.hash_value is not None, (
-                f"L3 marker {node.id} missing hash_value"
-            )
-            nodes_to_load.insert(0, node)
-            node = node.parent
-        ancestor_node = node
+        # Contiguous chain of loadable (L3-resident, hashed) evicted nodes below
+        # the first device-resident ancestor. A gap truncates it: nothing under an
+        # unservable node can be loaded, so that part recomputes.
+        nodes_to_load, ancestor_node, gap_nodes = collect_loadable_chain(
+            node, self.root_node
+        )
+        if gap_nodes:
+            self._log_l3_gap(gap_nodes)
+        if not nodes_to_load:
+            return None
 
         result = self.inc_lock_ref(ancestor_node)
         delta = result.delta
@@ -1981,21 +1994,19 @@ class HiRadixCache(RadixCache):
         # Collect the evicted l3-marker chain to load (parent-first): climb from the
         # deepest matched node up through contiguous evicted l3 nodes.
         _, best_node = self._match_prefix_helper(last_host_node, fetched_key)
-        nodes_to_load: List[TreeNode] = []
-        node = best_node
-        while node is not self.root_node and node.evicted:
-            assert self._node_l3_resident(node), (
-                f"evicted non-L3 node {node.id} in async discovery"
-            )
-            assert node.hash_value is not None, f"L3 marker {node.id} missing hash"
-            nodes_to_load.insert(0, node)
-            node = node.parent
-        ancestor = node
+        # A gap (evicted node with no host copy and no L3 claim) truncates the
+        # chain to the part above it — its suffix is unreachable and recomputes.
+        nodes_to_load, ancestor, gap_nodes = collect_loadable_chain(
+            best_node, self.root_node
+        )
+        if gap_nodes:
+            self._log_l3_gap(gap_nodes)
 
         if not nodes_to_load:
-            # Whole discovered prefix is already device-resident; nothing to load.
-            # (Every rank reaches this identically — the tree is TP-symmetric — so no
-            # alloc MIN is issued on any rank.)
+            # Whole discovered prefix is already device-resident (or a gap made all
+            # of it unreachable); nothing to load. (Every rank reaches this
+            # identically — the tree is TP-symmetric, and both gaps and marker drops
+            # come from post-MIN decisions — so no alloc MIN is issued on any rank.)
             self.dec_lock_ref(last_host_node)
             return True
 
@@ -2255,29 +2266,16 @@ class HiRadixCache(RadixCache):
         else:
             value = self._empty_match_result.device_indices
 
-        host_hit_length = 0
-        last_host_node = last_node
-        while last_node.evicted:
-            if last_node.backuped:
-                host_hit_length += len(last_node.host_value)
-            else:
-                # L2-bypass l3 marker (or self-written page evicted from device):
-                # no host_value, so count the node's own tokens by key length.
-                assert self.l2_bypass and self._node_l3_resident(last_node), (
-                    f"evicted non-backuped node {last_node.id} outside L2-bypass"
-                )
-                host_hit_length += len(last_node.key)
-            last_node = last_node.parent
-        if self.l2_bypass:
-            # Climb to the deepest L3-resident (or, if some page is host-backed on a
-            # mixed instance, backuped) node — the load-back start node.
-            while not (
-                last_host_node.backuped or self._node_l3_resident(last_host_node)
-            ):
-                last_host_node = last_host_node.parent
-        else:
-            while not last_host_node.backuped:
-                last_host_node = last_host_node.parent
+        # Climb the evicted chain: count host-backed (stock) / L3-resident
+        # (bypass) tokens. A node that is neither is a GAP — its KV is nowhere,
+        # so it and everything below it are a MISS (the climb restarts above it)
+        # instead of the assert that used to kill the scheduler.
+        climb = climb_evicted_chain(last_node, self.l2_bypass)
+        last_node = climb.last_device_node
+        last_host_node = climb.last_host_node
+        host_hit_length = climb.host_hit_length
+        if climb.gap_nodes:
+            self._log_l3_gap(climb.gap_nodes)
 
         return MatchResult(
             device_indices=value,
@@ -2459,20 +2457,39 @@ class HiRadixCache(RadixCache):
 
     def _drop_l3_markers(self, nodes: List[TreeNode]) -> None:
         """Drop L3 marker nodes whose device-direct load failed or was truncated,
-        so their tokens recompute instead of serving unverified KV. Detach deepest
-        first (a parent is only removed after its child marker), and only childless
-        markers that are still evicted (never became device-resident)."""
-        for n in reversed(nodes):
-            n.l3_present = False
-            if (
-                n.value is None
-                and len(n.children) == 0
-                and n.parent is not None
-            ):
-                child_key = n.key.child_key(self.page_size)
-                if n.parent.children.get(child_key) is n:
-                    n.parent.children.pop(child_key, None)
-                    self._update_leaf_status(n.parent)
+        so their tokens recompute instead of serving unverified KV.
+
+        The tree surgery (which markers can be detached, and which must keep their
+        L3 claim so they do not become unservable gaps) lives in
+        l3_marker_state.prune_l3_markers; here we only supply the set of nodes
+        another request's in-flight GET still owns and refresh the leaf status of
+        the parents we detached from."""
+        in_flight = {
+            n.id
+            for state in self._bypass_load_state.values()
+            for n in state.nodes_to_load
+        }
+        detached, _kept = prune_l3_markers(nodes, self.page_size, in_flight)
+        for n in detached:
+            self._update_leaf_status(n.parent)
+
+    def _log_l3_gap(self, gap_nodes: List[TreeNode]) -> None:
+        """A walk hit an evicted node with neither a host copy nor an L3 claim.
+        Its tokens are served as a MISS (recompute) — correct but a hit-rate loss,
+        so make it visible without spamming a per-request log line."""
+        first = self._l3_gap_count == 0
+        self._l3_gap_count += len(gap_nodes)
+        # A gap sits on a shared prefix, so it would be re-walked by every request
+        # until a recompute rehydrates it — throttle to the first hit and every
+        # 100th after that.
+        if first or self._l3_gap_count % 100 == 0:
+            logger.warning(
+                "l2bypass: %d unservable gap node(s) in match walk (ids=%s); "
+                "treated as cache miss, tokens recompute. total gaps: %d",
+                len(gap_nodes),
+                [n.id for n in gap_nodes],
+                self._l3_gap_count,
+            )
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
