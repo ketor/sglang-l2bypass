@@ -973,20 +973,56 @@ inline sizing (not the base path), so it is doubly excluded.
 - **`HostPoolGroup.size`**: inherits the stubbed anchor.
 - **`available_size()` reads** (hiradix prefetch shrink path): return the tiny free
   count → the None-handling shrink/skip path fires. Recompute-safe.
-- **`draft_host_pool.size`** (cache_controller:1149): log string only.
+- **`draft_host_pool.size`** (cache_controller `set_draft_kv_pool`): log string only —
+  but the draft pool's SLOT COUNT is load-bearing (target host_indices are used on
+  it verbatim), hence the process-shared stub count below.
 - **Slot-range asserts**: `alloc` only asserts `need_size % page_size == 0` and
   returns None when `need_size > available` — no hard assert on `size`. Staging
   buffers use `min(page_num, 64)` with `page_num >= 1` → no divide-by-zero.
 
 ## Sizing math
-Stub `self.size = _L2_BYPASS_STUB_PAGES * page_size` (raw), then the UNCHANGED
-stock page-align (`page_num = size // page_size + 1; size = page_num * page_size`)
-→ `(_L2_BYPASS_STUB_PAGES + 1) * page_size` tokens = 2 pages at
-`_L2_BYPASS_STUB_PAGES=1`. Positive, page-aligned, non-zero for any page size (the
-`< 4GB` divide-by-zero the operator hit was the GB→token conversion underflowing /
-downstream framework asserts; the stub sets the token count directly and never
-touches that path). At a GLM-5.2-ish ~45 KB/token main latent + page 64, the main
-buffer is ~5.8 MB; the indexer + draft add a few MB more — total tens of MB.
+Stub `self.size = max(_L2_BYPASS_STUB_PAGES, layer_num) * page_size` (raw), then the
+UNCHANGED stock page-align (`page_num = size // page_size + 1;
+size = page_num * page_size`). Positive, page-aligned, non-zero for any page size
+(the `< 4GB` divide-by-zero the operator hit was the GB→token conversion
+underflowing / downstream framework asserts; the stub sets the token count directly
+and never touches that path). At GLM-5.2 (78 layers, ~44.9 KB/token main latent,
+page 64) the main buffer is ~227 MB, the DSA indexer ~53 MB, the EAGLE draft a few
+MB — a few hundred MB total, against ~100 GB for an unstubbed `--hicache-size`.
+
+### Why the floor is `layer_num` pages, not 1 (fixes the on-node IndexError)
+The first cut used a flat 1 page and the scheduler died at construction:
+`IndexError: index 2 is out of bounds for dimension 0 with size 2`
+(`memory_pool_host.py:1295`). Root cause: **page-major layouts put `page_num` in
+dim0**, but the stock subclass constructors still build per-layer views out of that
+same dim0:
+
+| layout | buffer dim0 | per-layer view |
+|---|---|---|
+| MLA `layer_first` (`memory_pool_host.py:1325`) | `layer_num` | `kv_buffer[i]`, in range |
+| MLA `page_first` (`:1331`) | `size` | `transpose(0,1)[i]` (`:1293`), in range |
+| **MLA `page_first_direct` (`:1338`) / `page_first_kv_split` (`:1348`)** | **`page_num`** | **`kv_buffer[i] for i in range(layer_num)` (`:1295`)** |
+| **MHA `page_first_direct` (`:154`) / `page_head` (`:163`)** | **`page_num`** | **`k/v_buffer[i] ... range(layer_num)` (`:126-127`)** |
+
+Those page-major per-layer views are only ever in range because a real host pool has
+`page_num >> layer_num`; nothing in stock enforces it. The production node runs
+`--hicache-mem-layout page_first_direct`, so a 2-page stub with `layer_num=78` blew
+up immediately. The floor (`page_num = pages + 1 >= layer_num`, one page of margin)
+restores that implicit invariant **by capacity alone** — buffer shapes, layouts and
+dimension semantics stay exactly stock, no new branch in `memory_pool_host.py`.
+
+### Why the stub slot count is process-shared
+The draft host pool is deliberately built with
+`host_to_device_ratio = primary.size / draft_device.size` so its slot count matches
+the target host pool 1-to-1 (`kv_cache_builder.py:101-110`), and the controller then
+indexes the draft pool with the *target's* `host_indices`
+(`cache_controller.py:888` `backup_from_device_all_layer`, `:1716` `get_data_page`).
+The stub ignores ratio/`--hicache-size`, so a per-pool `layer_num` floor alone would
+give the 78-layer target 79 pages and the 1-layer EAGLE draft 1 page — a real
+out-of-range risk on the residual (bypass-declined) host path.
+`l2_bypass_shared_stub_raw_tokens` therefore memoizes one monotonic-max token count
+per `page_size` for the whole process; the target is constructed first (the draft
+registers against an existing tree cache), so every later stub pool reuses it.
 
 ## `--hicache-size` semantics under bypass+stub
 `--hicache-size` becomes **irrelevant** — the stub ignores it and logs so at
@@ -999,17 +1035,22 @@ demonstration; increment 6 makes the shrink automatic and total.)
 
 ## Changed files / functions (increment 6)
 ### mem_cache/pool_host/bypass.py (NEW, pure — no torch/sglang at module load)
-- `_L2_BYPASS_STUB_PAGES = 1`; `env_l2_bypass_requested()`;
-  `l2_bypass_stub_raw_tokens(page_size)` / `l2_bypass_stub_tokens(page_size)` (the
-  pre-/post-align token counts, exposed for tests);
+- `_L2_BYPASS_STUB_PAGES = 1` (floor); `env_l2_bypass_requested()`;
+  `l2_bypass_stub_pages(layer_num)` — `max(_L2_BYPASS_STUB_PAGES, layer_num)`, the
+  page-major dim0 invariant above; `l2_bypass_stub_raw_tokens(page_size, layer_num)`
+  / `l2_bypass_stub_tokens(page_size, layer_num)` (pure pre-/post-align token counts,
+  exposed for tests); `l2_bypass_shared_stub_raw_tokens(page_size, layer_num)` — the
+  process-shared monotonic-max count the constructor uses (+
+  `reset_l2_bypass_stub_sizing()` for tests);
   `l2_bypass_stub_applies(device_pool)` — the gate (env flag AND lazy
   `device_page_meta.supported`; any import failure → False = keep real pool).
 
 ### mem_cache/pool_host/base.py
 - `HostKVCache.__init__` — compute `self.l2_bypass_stub = l2_bypass_stub_applies(
-  device_pool)`; when set, size from `_L2_BYPASS_STUB_PAGES` instead of
+  device_pool)`; when set, size from
+  `l2_bypass_shared_stub_raw_tokens(page_size, device_pool.layer_num)` instead of
   `--hicache-size`/ratio and skip the big-memory warning+check in favor of the stub
-  log. **Stock branches are byte-identical, merely re-indented under `else:`**; with
+  log (which also reports `page_num` and `layer_num`). **Stock branches are byte-identical, merely re-indented under `else:`**; with
   the flag off `l2_bypass_stub` is False (env short-circuit, no device_page_meta
   import) and the original path runs verbatim.
 
@@ -1017,9 +1058,14 @@ demonstration; increment 6 makes the shrink automatic and total.)
 `tests/test_l2_bypass_stub.py` (pure python, no GPU/torch): env-flag parser
 (truthy/falsy/whitespace), stub token count is positive+page-aligned+non-zero for
 page sizes 1..256, final == raw + page_size (matches the constructor align),
-footprint stays tens-of-MB, and the gate short-circuits on the env flag /
+footprint stays small, and the gate short-circuits on the env flag /
 defers to a (fake-injected) `device_page_meta.supported` / declines on
-missing-module. 11 tests pass. The base constructor's torch-coupled allocation is
+missing-module. Plus the post-crash invariants: `page_num >= layer_num` for every
+(page_size 1..256) x (layer_num 1..126) pair including the exact GLM-5.2 regression
+case (64/78), the floor stays capacity-only (page-aligned, `final == raw +
+page_size`), the default `layer_num` keeps the 1-page stub, footprint stays well
+under a GB, and the shared slot count makes the 1-layer draft match the 78-layer
+target (monotonic max, per-page_size, resettable). 21 tests pass. The base constructor's torch-coupled allocation is
 py_compile + review only (no GPU on the dev box), as increments 1-5.
 
 ## Known limitations / deviations (increment 6)

@@ -64,6 +64,12 @@ class TestEnvParser(unittest.TestCase):
 class TestStubSizing(unittest.TestCase):
     PAGE_SIZES = (1, 16, 32, 64, 128, 256)
 
+    def setUp(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
+    def tearDown(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
     def test_stub_pages_is_at_least_one(self):
         # < 1 would let page_num/staging degenerate; the whole point of a non-zero
         # stub is that every slot computation stays well-defined.
@@ -95,6 +101,112 @@ class TestStubSizing(unittest.TestCase):
         tokens = bypass.l2_bypass_stub_tokens(64)
         bytes_ = tokens * 45_000
         self.assertLess(bytes_ / 1e6, 50.0)  # tens of MB ceiling
+
+
+class TestStubLayerFloor(unittest.TestCase):
+    """The stub must never shrink a page-major buffer's dim0 below layer_num.
+
+    Reproduces the shape arithmetic of the stock constructors without torch:
+      MLA  page_first_direct -> (page_num, layer_num, page_size, 1, kv_cache_dim)
+      MHA  page_first_direct -> (2, page_num, layer_num, page_size, head, dim)
+    then `[buf[i] for i in range(layer_num)]` (memory_pool_host.py:1295 / :126).
+    """
+
+    PAGE_SIZES = (1, 16, 32, 64, 128, 256)
+    LAYER_NUMS = (1, 2, 32, 61, 78, 94, 126)
+
+    def setUp(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
+    def tearDown(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
+    @staticmethod
+    def _page_num(raw_tokens, page_size):
+        # HostKVCache.__init__ align, verbatim.
+        return raw_tokens // page_size + 1
+
+    def test_page_major_dim0_covers_every_layer(self):
+        for ps in self.PAGE_SIZES:
+            for layers in self.LAYER_NUMS:
+                bypass.reset_l2_bypass_stub_sizing()
+                raw = bypass.l2_bypass_stub_raw_tokens(ps, layers)
+                page_num = self._page_num(raw, ps)
+                # dim0 of a page-major buffer; per-layer views index 0..layers-1
+                self.assertGreaterEqual(
+                    page_num, layers, f"page_size={ps} layer_num={layers}"
+                )
+
+    def test_glm52_regression_case(self):
+        # The exact on-node crash: page_size=64, layer_num=78 gave page_num=2.
+        raw = bypass.l2_bypass_stub_raw_tokens(64, 78)
+        self.assertGreaterEqual(self._page_num(raw, 64), 78)
+
+    def test_layer_first_layouts_still_fine(self):
+        # layer_first puts layer_num in dim0; the floor must not break that view.
+        for layers in self.LAYER_NUMS:
+            bypass.reset_l2_bypass_stub_sizing()
+            raw = bypass.l2_bypass_stub_raw_tokens(64, layers)
+            self.assertGreater(raw, 0)
+            self.assertEqual(raw % 64, 0)
+
+    def test_default_layer_num_is_unchanged_single_page(self):
+        # Back-compat: callers that do not pass layer_num keep the 1-page stub.
+        self.assertEqual(
+            bypass.l2_bypass_stub_raw_tokens(64), bypass._L2_BYPASS_STUB_PAGES * 64
+        )
+
+    def test_floor_is_capacity_only_still_page_aligned(self):
+        for ps in self.PAGE_SIZES:
+            for layers in self.LAYER_NUMS:
+                bypass.reset_l2_bypass_stub_sizing()
+                final = bypass.l2_bypass_stub_tokens(ps, layers)
+                self.assertEqual(final % ps, 0)
+                self.assertEqual(
+                    final, bypass.l2_bypass_stub_raw_tokens(ps, layers) + ps
+                )
+
+    def test_footprint_stays_well_under_a_gb(self):
+        # GLM-5.2 main latent: 78 layers x 576 B = 44928 B/token, page 64.
+        tokens = bypass.l2_bypass_stub_tokens(64, 78)
+        self.assertLess(tokens * 44928 / 1e9, 0.5)
+
+
+class TestSharedStubSlotCount(unittest.TestCase):
+    """All stub pools in one process must expose the SAME slot count: the draft
+    host pool is indexed with the target pool's host_indices."""
+
+    def setUp(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
+    def tearDown(self):
+        bypass.reset_l2_bypass_stub_sizing()
+
+    def test_draft_matches_target(self):
+        target = bypass.l2_bypass_shared_stub_raw_tokens(64, 78)  # target: 78 layers
+        draft = bypass.l2_bypass_shared_stub_raw_tokens(64, 1)  # EAGLE draft: 1 layer
+        self.assertEqual(draft, target)
+
+    def test_monotonic_max_regardless_of_order(self):
+        small = bypass.l2_bypass_shared_stub_raw_tokens(64, 1)
+        big = bypass.l2_bypass_shared_stub_raw_tokens(64, 78)
+        self.assertGreater(big, small)
+        # once grown, later pools keep the grown value
+        self.assertEqual(bypass.l2_bypass_shared_stub_raw_tokens(64, 4), big)
+
+    def test_page_sizes_are_independent(self):
+        a = bypass.l2_bypass_shared_stub_raw_tokens(64, 78)
+        b = bypass.l2_bypass_shared_stub_raw_tokens(128, 1)
+        self.assertNotEqual(a, b)
+        self.assertEqual(b, bypass.l2_bypass_stub_raw_tokens(128, 1))
+
+    def test_reset_clears_state(self):
+        bypass.l2_bypass_shared_stub_raw_tokens(64, 78)
+        bypass.reset_l2_bypass_stub_sizing()
+        self.assertEqual(
+            bypass.l2_bypass_shared_stub_raw_tokens(64, 1),
+            bypass.l2_bypass_stub_raw_tokens(64, 1),
+        )
 
 
 class _FakeDevicePageMeta:

@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.bypass import (
-    _L2_BYPASS_STUB_PAGES,
+    l2_bypass_shared_stub_raw_tokens,
     l2_bypass_stub_applies,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -107,7 +107,13 @@ class HostKVCache(abc.ABC):
         # --hicache-size is ignored. Stock branches below are byte-identical.
         self.l2_bypass_stub = l2_bypass_stub_applies(device_pool)
         if self.l2_bypass_stub:
-            self.size = _L2_BYPASS_STUB_PAGES * self.page_size
+            # Capacity only: layouts whose buffer dim0 is page_num are still indexed
+            # per layer by the subclass constructors, so the stub must keep
+            # page_num >= layer_num, and every stub pool in the process must land on
+            # the same slot count (target<->draft host indices are 1-to-1).
+            self.size = l2_bypass_shared_stub_raw_tokens(
+                self.page_size, getattr(device_pool, "layer_num", 1)
+            )
         elif host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
@@ -126,12 +132,14 @@ class HostKVCache(abc.ABC):
             # and is never load-bearing (bypass never allocates a host slot).
             logger.info(
                 "HiCache L2-bypass stub host pool (%s): --hicache-size ignored, "
-                "host footprint ~%.1f MB (%d tokens x %d B/token); GPUDirect "
-                "GPU<->L3 owns the data path.",
+                "host footprint ~%.1f MB (%d tokens x %d B/token, %d pages for "
+                "%d layers); GPUDirect GPU<->L3 owns the data path.",
                 type(self).__name__,
                 requested_bytes / 1e6,
                 self.size,
                 self.size_per_token,
+                self.page_num,
+                getattr(device_pool, "layer_num", 1),
             )
         else:
             if self.size <= device_pool.size:
