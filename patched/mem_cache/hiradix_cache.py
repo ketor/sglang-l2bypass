@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+from collections import deque
 import time
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -279,8 +280,11 @@ class HiRadixCache(RadixCache):
         # 对这个实例已经失效，而它**完全静默**——表现只是"这一轮慢了点"，运维侧与
         # 正常波动无法区分。2026-07-26 那次 0% 崩溃是事后翻日志才发现的。
         # 这里不试图修复(根因未明)，只保证它发生时立刻可见。
-        self._l3_load_ok = 0
-        self._l3_load_fail = 0
+        # 🔴 必须是滑动窗口，不能用累计计数。第一版就错在这里: 累计的 ok 会无限
+        #    增长，跑够足够多成功轮后失败占比永远到不了阈值，告警**永久沉默**；
+        #    而且单轮全崩只有几次 load，也够不到最小样本量。2026-07-26 firstread
+        #    A#1 真崩溃时告警没响，正是这两条一起造成的。
+        self._l3_recent = deque(maxlen=24)
         self._l3_collapse_logged_at = 0.0
         # SGLANG_HICACHE_L2_BYPASS_DEDUP=0 reverts to the increment-3 behaviour
         # (every request issues its own GET, duplicates included). Same keys, same
@@ -2567,14 +2571,15 @@ class HiRadixCache(RadixCache):
         inventing a "fix" for an un-diagnosed fault is how you get a second bug.
         It only guarantees the condition is visible when it happens.
 
-        Fires at most once a minute, and only once there is enough signal to be
-        meaningful (>= 8 loads in the window) with a failure share >= 50%."""
-        if ok:
-            self._l3_load_ok += 1
-        else:
-            self._l3_load_fail += 1
-        total = self._l3_load_ok + self._l3_load_fail
-        if total < 8 or self._l3_load_fail * 2 < total:
+        Sliding window (last 24 loads), fires at most once a minute, needs >= 4
+        loads of signal and a failure share >= 50%. The window is what makes it
+        survive: cumulative counters go permanently silent once enough successes
+        accumulate, which is exactly how the first version missed a real crash."""
+        self._l3_recent.append(bool(ok))
+        total = len(self._l3_recent)
+        fail = total - sum(self._l3_recent)
+        # 最小样本 4: 单轮全崩通常只有 4 次 load，阈值定 8 会让它整轮沉默。
+        if total < 4 or fail * 2 < total:
             return
         now = time.monotonic()
         if now - self._l3_collapse_logged_at < 60.0:
@@ -2588,7 +2593,7 @@ class HiRadixCache(RadixCache):
             "(jumped => storage really lost the data; flat => the GET never "
             "reached storage or was served as a hit) against the client-side "
             "MISS/SHORT split in the dfkv access log.",
-            self._l3_load_fail, total, 100.0 * self._l3_load_fail / total)
+            fail, total, 100.0 * fail / total)
 
     def _find_inflight_owner(self, nodes_to_load) -> Optional[str]:
         """req_id of the in-flight load covering the parent-most node of this chain
