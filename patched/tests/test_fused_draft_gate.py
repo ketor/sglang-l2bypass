@@ -81,10 +81,11 @@ class TestEnvParser(unittest.TestCase):
             os.environ["SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT"] = v
 
     def test_default_is_off(self):
-        """Flipped 2026-07-25: the GPU A/B measured fusion as a net loss (R3
-        -43.5% tok/s, TTFT +254%, `0 pages verified across ranks` x96 — the fused
-        write layout and the fused read do not agree). The knob stays, the default
-        does not. Re-flip only alongside a passing R3 A/B."""
+        """Flipped 2026-07-25: in the one controlled A/B we have, fusion did not
+        pay for itself (R2 +17.5% but R3 -43.5% tok/s, and an op mix showing
+        re-derivation: reads 13 -> 8, writes 55 -> 134). No root cause established
+        — see env_l2_bypass_fuse_draft's docstring for why the first attribution
+        was withdrawn. Default off until a repeated-R3 A/B says otherwise."""
         self._set(None)
         self.assertFalse(self.fn())
 

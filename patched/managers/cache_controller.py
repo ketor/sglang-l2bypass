@@ -86,26 +86,33 @@ def env_l2_bypass_fuse_draft() -> bool:
     their own RDMA round trip (the increment-4/5 standalone
     batch_set/get_v1_device_draft calls).
 
-    🔴 DEFAULT IS **OFF** since the 2026-07-25 GPU A/B measured it as a net LOSS.
-    The op-count collapse is real — the standalone draft ops go to exactly 0 — and
-    the write/hot-local rounds do improve (R2 +17.5%). But the hot-L3 round
-    REGRESSES hard: R3 36,784 -> 20,783 tok/s (-43.5%) with median TTFT
-    5.4s -> 19.2s (+254%).
+    🔴 DEFAULT IS **OFF**: in the one controlled A/B we have (2026-07-25, EAGLE,
+    100k x C8), fusion did not pay for itself. R2 hot-local improved (30,706 ->
+    36,065 tok/s, +17.5%) but hot-L3 came out worse (R3 36,784 -> 20,783 tok/s,
+    median TTFT 5.4s -> 19.2s). The op-count collapse itself is real and verified:
+    the standalone draft ops go to exactly 0.
 
-    Root cause is NOT the op count: dfkv `batch_exists` still reports prefix=1562/
-    1562 (the pages ARE in L3), but the promotion's per-page cross-rank
-    verification then rejects the whole load — `0 pages verified across ranks`
-    fired 96 times in one R3 round. Every rejected load drops its markers and
-    recomputes, which is why reads fall (13 -> 8 GETs) while writes explode
-    (55 -> 134 set_v2_device): the instance is re-deriving and re-writing what it
-    just failed to accept. So the fused WRITE layout and what the fused READ
-    reconstructs do not agree byte-for-byte.
+    EVIDENCE STRENGTH — read this before trusting the number above. A single R3
+    measurement is weak: R3 restarts the engine, and the phase-5 work established
+    that a post-restart first round runs ~40% below steady state, which is the
+    same order as the delta being claimed. The supporting signal that is NOT
+    throughput noise is the op mix: reads fell 13 -> 8 while writes rose 55 -> 134
+    (set_v2_device), i.e. the instance re-deriving and re-writing pages it failed
+    to accept.
 
-    Correctness was never at risk — that verified-MIN gate is exactly what caught
-    it, and the needle answer stayed correct throughout. This is a hit-rate defect,
-    not a data defect. Kept behind the flag (not deleted) so the layout bug can be
-    fixed and re-measured; do NOT flip this back on without re-running the R3 A/B
-    and confirming `0 pages verified across ranks` stays at 0."""
+    A root cause has NOT been established. An earlier revision of this comment
+    blamed a fused-write/fused-read layout mismatch, citing `0 pages verified
+    across ranks` firing 96 times. That attribution was wrong: a later FUSE=0 run
+    showed the SAME failure mode at baseline (24 and 56 occurrences), so it is a
+    pre-existing bypass read-path issue, not something fusion introduces. Fusion
+    may or may not make it worse — that has never been measured on one workload.
+
+    Correctness was never at risk in any of these runs (needle stayed correct);
+    the verified-MIN gate rejects, it does not corrupt.
+
+    Kept behind the flag rather than reverted. To flip it back on, do NOT rely on
+    one R3: repeat R3 several times per arm on the SAME workload and compare
+    distributions, and separately investigate the baseline verified-rejections."""
     return os.environ.get(
         "SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT", "0"
     ).strip().lower() not in ("", "0", "false", "no", "off")
