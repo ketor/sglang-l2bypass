@@ -1634,7 +1634,7 @@ exactly once.
 
 ## Observability
 
-`_bypass_stats` gains `dedup_parks` (duplicate GETs avoided), `dedup_pages_saved`
+`device_pin_census()` gains `dedup_parks` (duplicate GETs avoided), `dedup_pages_saved`
 (the RDMA pages those GETs would have re-read), `dedup_waiters_now`, and
 `dedup_wait_timeouts` — the last should stay **0**; nonzero means owners are
 stalling, not that the dedup is misbehaving.

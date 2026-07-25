@@ -269,10 +269,11 @@ class HiRadixCache(RadixCache):
         # chain: a waiter never owns an in-flight load, so it never appears in
         # _bypass_inflight_owner.
         self._bypass_waiters: Dict[str, tuple] = {}
-        # Counters for the dedup (reported by _bypass_stats).
+        # Counters for the dedup (reported by device_pin_census).
         self._bypass_dedup_parks = 0
         self._bypass_dedup_pages_saved = 0
         self._bypass_dedup_wait_timeouts = 0
+        self._dedup_logged_at = 0.0
         # L2-bypass: number of times a match/load walk hit a GAP node (evicted,
         # no host copy, no L3 claim). Such a node is served as a MISS; the count
         # is the health signal for the marker state machine (steady growth means
@@ -2328,6 +2329,7 @@ class HiRadixCache(RadixCache):
             # after the owner resolves. Whichever exit is finally taken decs it once.
             self._pending_l3_discovery[req_id] = pending
             self._bypass_waiters[req_id] = (owner, time.monotonic())
+            self._log_dedup_progress()
             return False
 
         # Pin the ancestor for the whole loading window (protects the chain up to
@@ -2510,6 +2512,27 @@ class HiRadixCache(RadixCache):
         # Release the ancestor pin held across the loading window.
         self.dec_lock_ref(ancestor)
         return True
+
+    def _log_dedup_progress(self) -> None:
+        """One throttled INFO line so the dedup is verifiable on a live box.
+
+        device_pin_census() carries the same counters, but it is only printed from
+        the pin-pressure WARNING — i.e. never on a healthy run, which is exactly
+        when you want to confirm the dedup is firing. Throttled to one line per
+        minute and emitted only from the park branch, so a run that never dedups
+        stays silent."""
+        now = time.monotonic()
+        if now - self._dedup_logged_at < 60.0:
+            return
+        self._dedup_logged_at = now
+        logger.info(
+            "l2bypass dedup: %d duplicate device GET(s) avoided so far "
+            "(%d RDMA pages not re-read); %d waiter(s) parked now, %d wait timeout(s).",
+            self._bypass_dedup_parks,
+            self._bypass_dedup_pages_saved,
+            len(self._bypass_waiters),
+            self._bypass_dedup_wait_timeouts,
+        )
 
     def _find_inflight_owner(self, nodes_to_load) -> Optional[str]:
         """req_id of the in-flight load covering the parent-most node of this chain
