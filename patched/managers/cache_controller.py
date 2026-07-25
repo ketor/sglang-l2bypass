@@ -81,16 +81,33 @@ def env_l2_bypass_sync_read() -> bool:
 
 
 def env_l2_bypass_fuse_draft() -> bool:
-    """Increment 7: SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=0 reverts the EAGLE draft
-    L3 IO to its own RDMA round trip (the increment-4/5 standalone
-    batch_set/get_v1_device_draft calls). Default ON => the draft's sub-keys ride
-    INSIDE the target page's scatter-gather batch, so draft L3 adds no RDMA op.
-    Same keys, same bytes, same results either way — purely an op-count knob, kept
-    so the draft-fusion effect can be A/B'd without redeploying. Only meaningful
-    when SGLANG_HICACHE_L2_BYPASS=1 and the backend advertises
-    supports_fused_draft_device()."""
+    """Increment 7: SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT=1 makes the EAGLE draft's
+    sub-keys ride INSIDE the target page's scatter-gather batch instead of taking
+    their own RDMA round trip (the increment-4/5 standalone
+    batch_set/get_v1_device_draft calls).
+
+    🔴 DEFAULT IS **OFF** since the 2026-07-25 GPU A/B measured it as a net LOSS.
+    The op-count collapse is real — the standalone draft ops go to exactly 0 — and
+    the write/hot-local rounds do improve (R2 +17.5%). But the hot-L3 round
+    REGRESSES hard: R3 36,784 -> 20,783 tok/s (-43.5%) with median TTFT
+    5.4s -> 19.2s (+254%).
+
+    Root cause is NOT the op count: dfkv `batch_exists` still reports prefix=1562/
+    1562 (the pages ARE in L3), but the promotion's per-page cross-rank
+    verification then rejects the whole load — `0 pages verified across ranks`
+    fired 96 times in one R3 round. Every rejected load drops its markers and
+    recomputes, which is why reads fall (13 -> 8 GETs) while writes explode
+    (55 -> 134 set_v2_device): the instance is re-deriving and re-writing what it
+    just failed to accept. So the fused WRITE layout and what the fused READ
+    reconstructs do not agree byte-for-byte.
+
+    Correctness was never at risk — that verified-MIN gate is exactly what caught
+    it, and the needle answer stayed correct throughout. This is a hit-rate defect,
+    not a data defect. Kept behind the flag (not deleted) so the layout bug can be
+    fixed and re-measured; do NOT flip this back on without re-running the R3 A/B
+    and confirming `0 pages verified across ranks` stays at 0."""
     return os.environ.get(
-        "SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT", "1"
+        "SGLANG_HICACHE_L2_BYPASS_FUSE_DRAFT", "0"
     ).strip().lower() not in ("", "0", "false", "no", "off")
 
 
