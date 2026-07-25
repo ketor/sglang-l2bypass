@@ -274,6 +274,13 @@ class HiRadixCache(RadixCache):
         self._bypass_dedup_pages_saved = 0
         self._bypass_dedup_wait_timeouts = 0
         self._dedup_logged_at = 0.0
+        # SGLANG_HICACHE_L2_BYPASS_DEDUP=0 reverts to the increment-3 behaviour
+        # (every request issues its own GET, duplicates included). Same keys, same
+        # bytes, same results either way — purely a duplicate-op knob, kept so the
+        # dedup can be A/B'd without redeploying.
+        self._dedup_enabled = os.environ.get(
+            "SGLANG_HICACHE_L2_BYPASS_DEDUP", "1"
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         # L2-bypass: number of times a match/load walk hit a GAP node (evicted,
         # no host copy, no L3 claim). Such a node is served as a MISS; the count
         # is the health signal for the marker state machine (steady growth means
@@ -2542,6 +2549,8 @@ class HiRadixCache(RadixCache):
         claimed node is the one whose owner will publish the longest usable prefix
         for us. Claims of an already-departed request cannot linger — promote and
         abort are the only exits from _bypass_load_state and both release them."""
+        if not self._dedup_enabled:
+            return None
         for n in nodes_to_load:
             owner = self._bypass_inflight_owner.get(n.id)
             if owner is not None:

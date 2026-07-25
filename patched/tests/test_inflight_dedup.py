@@ -99,6 +99,7 @@ class _Cache:
         self._bypass_dedup_pages_saved = 0
         self._bypass_dedup_wait_timeouts = 0
         self._device_load_timeout = timeout
+        self._dedup_enabled = True
 
     find_owner = NS["_find_inflight_owner"]
     release_claims = NS["_release_inflight_claims"]
@@ -225,6 +226,35 @@ class InflightDedupTest(unittest.TestCase):
         c.claim("reqA", chain)
         c.park("reqB", "reqA", chain)
         self.assertNotIn("reqB", set(c._bypass_inflight_owner.values()))
+
+
+class FlagOffEquivalenceTest(unittest.TestCase):
+    """SGLANG_HICACHE_L2_BYPASS_DEDUP=0 must behave exactly like increment 3."""
+
+    def test_disabled_never_finds_an_owner(self):
+        c = _Cache()
+        c._dedup_enabled = False
+        chain = [_Node(1)]
+        c.claim("reqA", chain)
+        self.assertIsNone(
+            c.find_owner(chain), "flag off => nobody parks, every request loads")
+
+    def test_enabled_is_the_default_parse(self):
+        import os as _os
+        for raw, want in (
+            (None, True), ("1", True), ("true", True), ("yes", True),
+            ("0", False), ("off", False), ("false", False), ("no", False),
+            ("", False), (" 0 ", False),
+        ):
+            if raw is None:
+                _os.environ.pop("SGLANG_HICACHE_L2_BYPASS_DEDUP", None)
+            else:
+                _os.environ["SGLANG_HICACHE_L2_BYPASS_DEDUP"] = raw
+            got = _os.environ.get(
+                "SGLANG_HICACHE_L2_BYPASS_DEDUP", "1"
+            ).strip().lower() not in ("", "0", "false", "no", "off")
+            self.assertEqual(got, want, f"raw={raw!r}")
+        _os.environ.pop("SGLANG_HICACHE_L2_BYPASS_DEDUP", None)
 
 
 class SourceLevelInvariantsTest(unittest.TestCase):
