@@ -1572,3 +1572,90 @@ ledger empties. Plus `audit_pins` attribution incl. the orphan case.
 device page meta / fused draft gate / stub host pool).
 
 Not GPU-verified on this box (no torch) — same standing caveat as increments 1-7.
+
+---
+
+# Increment 8 — one GET per chain (in-flight load dedup)
+
+## Problem
+
+Two concurrent requests that share a prefix each run their own exist-discovery,
+each end up with the SAME evicted l3-marker chain, and each allocate GPU slots and
+issue their own device SG GET for **identical pages**. One of those GETs is pure
+waste, and it is waste on the TTFT critical path — the second request pays full L3
+read latency for bytes already in flight.
+
+This is not hypothetical: the async read (increment 3) parks a request for the
+whole load window, so the window in which a sibling request can discover the same
+chain is exactly as long as an L3 read of a 100k-token prompt.
+
+## Fix
+
+A request that finds any node of its chain already claimed by an in-flight load
+becomes a **waiter**: no slots, no task, no GET. It keeps its discovery pending and
+re-plans once the owner resolves — by then the chain is device-resident, so the
+re-plan finds nothing to load and the request proceeds on the owner's bytes.
+
+Two dicts carry it (`hiradix_cache.py`):
+
+* `_bypass_inflight_owner: node id -> req_id`, written only **after** the alloc MIN
+  (so every rank writes the same entries) and released on promote **and** abort.
+* `_bypass_waiters: req_id -> (owner req_id, since)`.
+
+Why an overlap is always a prefix: the chain is a contiguous parent-first path, so
+a shared node implies a shared head. Loading only the suffix would leave a hole the
+request could not be scheduled over anyway, which is why the waiter parks whole
+rather than splitting the chain.
+
+## 🔴 No new collective
+
+`_bypass_inflight_owner` is a pure function of TP-symmetric state (claims are
+written post-MIN; node ids are TP-symmetric), so **every rank takes the same park
+branch** and a waiter round issues **zero** collectives. This is asserted at the
+source level in the tests — a reduce accidentally added to the park branch would
+unbalance the per-round sequence and hang the ring.
+
+## Termination (every way a waiter can end)
+
+| Owner outcome | Waiter |
+|---|---|
+| promotes | claims released at promote entry -> re-plans, chain resident, nothing to load |
+| aborts / stalls | claims released in `_abort_async_load` -> re-plans, becomes the owner itself |
+| never answers | `_device_load_timeout` (same deadline that bounds the owner) fires -> re-plans |
+| waiter itself aborted | `release_aborted_request` drops the waiter record with the discovery |
+| tree reset | both dicts cleared alongside `_bypass_load_state` |
+
+No waiter chains are possible: a waiter holds no task, so it never appears in
+`_bypass_inflight_owner`, so nobody can wait on a waiter.
+
+The anchor pin taken at discovery is **held across the park** (not re-taken): the
+park branch does not `dec_lock_ref`, and whichever exit is finally taken decs it
+exactly once.
+
+## Observability
+
+`_bypass_stats` gains `dedup_parks` (duplicate GETs avoided), `dedup_pages_saved`
+(the RDMA pages those GETs would have re-read), `dedup_waiters_now`, and
+`dedup_wait_timeouts` — the last should stay **0**; nonzero means owners are
+stalling, not that the dedup is misbehaving.
+
+## Files
+
+`mem_cache/hiradix_cache.py` only. **No new bind-mount file.**
+
+## Tests
+
+`tests/test_inflight_dedup.py` (NEW, 14 cases, pure python, AST-extracts the real
+function bodies): no-overlap does not park; overlap parks and counts the saved
+pages; the owner is the parent-most claim; the waiter resumes after the owner
+promotes, after it aborts (and can then own the chain itself), and on deadline;
+`timeout <= 0` means wait forever on a live owner (same convention as the rest of
+the state machine); releases are owner-keyed so a re-claimed node is not stolen;
+waiters never become owners. Plus source-level asserts: both exits release claims,
+the park branch keeps the discovery pending, the park branch is collective-free,
+aborted requests drop the waiter record, and reset clears both dicts.
+
+`py_compile` clean. All 7 suites pass (marker state / async read / device page meta
+/ fused draft gate / stub host pool / device pin ledger / inflight dedup).
+
+Not GPU-verified yet — same standing caveat as increments 1-7.

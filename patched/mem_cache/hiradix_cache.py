@@ -252,6 +252,27 @@ class HiRadixCache(RadixCache):
         # scheduler parks the request in the waiting queue until every rank's local
         # GET has landed. Empty and inert unless async L2-bypass read is on.
         self._bypass_load_state: Dict[str, _BypassLoadState] = {}
+        # L2-bypass (increment 8) in-flight load dedup. Two concurrent requests that
+        # share a prefix independently discover the SAME evicted l3-marker chain, and
+        # without this map both would allocate GPU slots and issue their own SG GET
+        # for identical pages — one of them pure waste on the TTFT critical path.
+        #
+        # node id -> req_id of the request whose in-flight GET covers it. Written
+        # only when a load is submitted (post alloc-MIN, so every rank writes the
+        # same entries) and cleared on promote/abort. Because it is a pure function
+        # of TP-symmetric state, the overlap test below needs NO collective.
+        self._bypass_inflight_owner: Dict[int, str] = {}
+        # req_id -> (owner req_id, waiting-since monotonic). A waiter holds NO slots
+        # and NO task: it kept its discovery pending and simply re-plans once the
+        # owner's load lands (its chain is device-resident by then, so the re-plan
+        # finds nothing to load) or aborts (it becomes the owner). Waiters cannot
+        # chain: a waiter never owns an in-flight load, so it never appears in
+        # _bypass_inflight_owner.
+        self._bypass_waiters: Dict[str, tuple] = {}
+        # Counters for the dedup (reported by _bypass_stats).
+        self._bypass_dedup_parks = 0
+        self._bypass_dedup_pages_saved = 0
+        self._bypass_dedup_wait_timeouts = 0
         # L2-bypass: number of times a match/load walk hit a GAP node (evicted,
         # no host copy, no L3 claim). Such a node is served as a MISS; the count
         # is the health signal for the marker state machine (steady growth means
@@ -857,6 +878,9 @@ class HiRadixCache(RadixCache):
         # background device-load thread (so no GET is still running) and the KV pool
         # is wiped below, so the tasks' GPU slots go with it. Just drop the handles.
         self._bypass_load_state.clear()
+        # Dedup bookkeeping references node ids of the tree being wiped.
+        self._bypass_inflight_owner.clear()
+        self._bypass_waiters.clear()
         # Deferred device pins reference nodes of the tree being wiped, and
         # cache_controller.reset() already joined the backup thread. Drop the
         # ledger with them (no dec_lock_ref: the whole tree goes).
@@ -1994,6 +2018,13 @@ class HiRadixCache(RadixCache):
             "evictable_size": self.evictable_size_,
             "in_flight_loads": len(self.ongoing_load_back),
             "in_flight_device_reads": len(self._bypass_load_state),
+            # Increment 8 dedup: parks = duplicate GETs avoided; pages_saved = the
+            # RDMA pages those GETs would have re-read; wait_timeouts should stay 0
+            # (nonzero means owners are stalling, not that dedup is misbehaving).
+            "dedup_parks": self._bypass_dedup_parks,
+            "dedup_pages_saved": self._bypass_dedup_pages_saved,
+            "dedup_wait_timeouts": self._bypass_dedup_wait_timeouts,
+            "dedup_waiters_now": len(self._bypass_waiters),
         }
 
     def _log_device_pin_audit(self, reason: str) -> None:
@@ -2188,11 +2219,42 @@ class HiRadixCache(RadixCache):
         runs discovery + submits the background GET and returns False (park); each
         SUBSEQUENT call polls the background completion, returning False until every
         rank's local load has landed, then promotes and returns True."""
+        # Increment 8: a waiter parked on another request's in-flight load. The
+        # owner lookup is a dict probe over TP-symmetric state, so a waiter round
+        # issues NO collective on any rank — the sequences stay balanced.
+        if req_id in self._bypass_waiters:
+            if not self._resume_deduped_waiter(req_id):
+                return False
         if req_id in self._pending_l3_discovery:
             return self._start_l3_async_load(req_id)
         if req_id in self._bypass_load_state:
             return self._poll_l3_async_load(req_id)
         # No discovery was queued for this req, or it already promoted/aborted.
+        return True
+
+    def _resume_deduped_waiter(self, req_id: str) -> bool:
+        """True when a deduped waiter may re-plan this round (its owner finished or
+        the wait deadline expired), False while it should keep parking.
+
+        The deadline is the same one that bounds an owner's own load, so a backend
+        that stops answering cannot strand a waiter any longer than it strands the
+        owner it waits on — and when it fires the waiter simply plans its own load
+        (or recomputes) instead of being abandoned."""
+        owner, since = self._bypass_waiters[req_id]
+        if owner in self._bypass_load_state:
+            if (
+                self._device_load_timeout > 0
+                and time.monotonic() - since > self._device_load_timeout
+            ):
+                self._bypass_dedup_wait_timeouts += 1
+                logger.warning(
+                    "l2bypass dedup: req %s waited >%.0fs on req %s's in-flight "
+                    "load; re-planning its own load.",
+                    req_id, self._device_load_timeout, owner,
+                )
+            else:
+                return False
+        self._bypass_waiters.pop(req_id, None)
         return True
 
     def _start_l3_async_load(self, req_id: str) -> bool:
@@ -2246,6 +2308,28 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(last_host_node)
             return True
 
+        # Increment 8 (dedup): if another request's in-flight GET already covers any
+        # of this chain, do NOT issue a second GET for the same pages. Park as a
+        # waiter instead — no slots, no task, discovery kept pending — and re-plan
+        # once the owner lands. The chain is a contiguous parent-first path, so an
+        # overlap is always a prefix of it, and loading only the suffix would leave
+        # a hole this request could not be scheduled over anyway.
+        #
+        # No collective here: _bypass_inflight_owner is written only after the
+        # alloc MIN, so every rank holds the same map and takes the same branch.
+        owner = self._find_inflight_owner(nodes_to_load)
+        if owner is not None:
+            self._bypass_dedup_parks += 1
+            self._bypass_dedup_pages_saved += sum(
+                len(n.hash_value) for n in nodes_to_load
+                if self._bypass_inflight_owner.get(n.id) == owner
+            )
+            # Keep the anchor pin and the discovery: the dispatcher re-enters here
+            # after the owner resolves. Whichever exit is finally taken decs it once.
+            self._pending_l3_discovery[req_id] = pending
+            self._bypass_waiters[req_id] = (owner, time.monotonic())
+            return False
+
         # Pin the ancestor for the whole loading window (protects the chain up to
         # root, incl. last_host_node's path when it lies above the ancestor), then
         # drop the discovery-time anchor pin.
@@ -2283,6 +2367,10 @@ class HiRadixCache(RadixCache):
         # Hand the GET to the background thread; park until it lands.
         self.cache_controller.submit_device_load(task)
         self.cache_controller.prefetch_tokens_occupied += total_tokens
+        # Claim the chain so a concurrent request with the same prefix parks on this
+        # GET instead of issuing its own (cleared on promote/abort).
+        for n in nodes_to_load:
+            self._bypass_inflight_owner[n.id] = req_id
         self._bypass_load_state[req_id] = _BypassLoadState(
             task=task,
             nodes_to_load=nodes_to_load,
@@ -2339,6 +2427,10 @@ class HiRadixCache(RadixCache):
         task = state.task
         nodes_to_load = state.nodes_to_load
         ancestor = state.ancestor
+
+        # The GET has landed: drop the dedup claims so any waiter re-plans from the
+        # post-promotion tree. Done up front so every exit below releases them.
+        self._release_inflight_claims(req_id, nodes_to_load)
 
         # Release the device-token charge (gate #1 budget) regardless of outcome.
         self.cache_controller.prefetch_tokens_occupied -= state.device_tokens
@@ -2419,6 +2511,27 @@ class HiRadixCache(RadixCache):
         self.dec_lock_ref(ancestor)
         return True
 
+    def _find_inflight_owner(self, nodes_to_load) -> Optional[str]:
+        """req_id of the in-flight load covering the parent-most node of this chain
+        that anyone already claims, else None.
+
+        Parent-most, not any: the chain is a contiguous path, so the earliest
+        claimed node is the one whose owner will publish the longest usable prefix
+        for us. Claims of an already-departed request cannot linger — promote and
+        abort are the only exits from _bypass_load_state and both release them."""
+        for n in nodes_to_load:
+            owner = self._bypass_inflight_owner.get(n.id)
+            if owner is not None:
+                return owner
+        return None
+
+    def _release_inflight_claims(self, req_id: str, nodes_to_load) -> None:
+        """Drop this request's dedup claims. Keyed by owner so a node re-claimed by
+        a later load is not stolen from its new owner."""
+        for n in nodes_to_load:
+            if self._bypass_inflight_owner.get(n.id) == req_id:
+                del self._bypass_inflight_owner[n.id]
+
     def _abort_async_load(self, req_id: str) -> None:
         """Tear down an in-flight async device load (abort/detach/stall).
 
@@ -2440,6 +2553,9 @@ class HiRadixCache(RadixCache):
         state = self._bypass_load_state.pop(req_id, None)
         if state is None:
             return
+        # Waiters parked on this load must stop waiting: the pages are NOT coming.
+        # Releasing the claims lets them re-plan and issue their own GET.
+        self._release_inflight_claims(req_id, state.nodes_to_load)
         self._orphaned_device_tasks.append(state.task)
         self._drop_l3_markers(state.nodes_to_load)
         self.dec_lock_ref(state.ancestor)
@@ -2971,6 +3087,10 @@ class HiRadixCache(RadixCache):
         pending = self._pending_l3_discovery.pop(rid, None)
         if pending is not None:
             self.dec_lock_ref(pending[0])
+        # A deduped waiter (increment 8) holds no slots and no task — only the entry
+        # above and this one — but a stale waiter record would park a recycled
+        # req_id on a long-departed owner, so drop it with the discovery.
+        self._bypass_waiters.pop(rid, None)
 
         # L2-bypass async read: a request aborted mid-load still owns GPU slots (the
         # background GET may be writing them), the ancestor pin, and the device-token
