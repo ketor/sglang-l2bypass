@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.device_pin_ledger import DevicePinLedger, audit_pins
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -97,6 +98,7 @@ class _BypassLoadState:
         "ancestor",
         "device_tokens",
         "last_hit_node_id",
+        "submitted_at",
     )
 
     def __init__(self, task, nodes_to_load, ancestor, device_tokens, last_hit_node_id):
@@ -105,6 +107,11 @@ class _BypassLoadState:
         self.ancestor = ancestor
         self.device_tokens = device_tokens
         self.last_hit_node_id = last_hit_node_id
+        # When the GET was handed to the background thread. A request parks in the
+        # waiting queue until its load lands, so a backend that never returns would
+        # hold these GPU slots (and the ancestor pin) for the life of the process
+        # with nothing to abort it — _poll_l3_async_load deadlines on this.
+        self.submitted_at = time.monotonic()
 
 
 class HiRadixCache(RadixCache):
@@ -250,6 +257,33 @@ class HiRadixCache(RadixCache):
         # is the health signal for the marker state machine (steady growth means
         # markers are being stranded somewhere).
         self._l3_gap_count = 0
+        # L2-bypass deferred device pins: op_id -> (node, tokens, taken_at). A
+        # write-through node's GPU KV slot is the RDMA source for its device->L3
+        # PUT, so it stays lock_ref'd until that PUT acks — the ONE lock here whose
+        # release depends on an external system. The ledger bounds and exposes it
+        # (see mem_cache/device_pin_ledger.py); `_device_pin_ops` keeps the
+        # operation handles the reaper needs to cancel safely. Empty off bypass.
+        self._device_pins = DevicePinLedger()
+        self._device_pin_ops: Dict[int, object] = {}
+        # Seconds a device pin may go un-acked before the reaper reclaims it.
+        # 0 disables reaping (ack-only, the pre-reaper behavior).
+        self._device_pin_timeout = float(
+            os.environ.get("SGLANG_HICACHE_L2_BYPASS_PIN_TIMEOUT_S", "120")
+        )
+        self._device_pin_reclaimed_ops = 0
+        self._device_pin_reclaimed_tokens = 0
+        self._device_pin_stuck_ops = 0
+        self._device_pin_census_logged = 0.0
+        self._device_pin_audit_logged = 0.0
+        # DeviceLoadTasks whose request went away while their GET was still in
+        # flight. Their GPU slots cannot be freed yet (the NIC may still be writing
+        # them), so they are parked here FIFO and reclaimed once `done` fires.
+        self._orphaned_device_tasks: List[object] = []
+        # Seconds an async device load may stay in flight before it is abandoned.
+        # 0 disables the deadline (park forever, the pre-deadline behavior).
+        self._device_load_timeout = float(
+            os.environ.get("SGLANG_HICACHE_L2_BYPASS_LOAD_TIMEOUT_S", "180")
+        )
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -613,7 +647,10 @@ class HiRadixCache(RadixCache):
                     if self.l2_bypass:
                         # Bypass pins the GPU slot via lock_ref (not host_ref). Task 4:
                         # the DSA sidecar is device-direct (no host staging to free).
-                        self.dec_lock_ref(node)
+                        # The controller's threads are already joined here, so no PUT
+                        # can be reading these slots.
+                        if self._device_pins.pop(ack_id) is not None:
+                            self.dec_lock_ref(node)
                     else:
                         node.release_host()
                 except Exception:
@@ -621,6 +658,7 @@ class HiRadixCache(RadixCache):
                         "Failed to release protection for backup op %s", ack_id
                     )
                 self.ongoing_backup.pop(ack_id, None)
+                self._device_pin_ops.pop(ack_id, None)
         except Exception:
             logger.exception("Force release pending backup ops failed.")
 
@@ -630,6 +668,9 @@ class HiRadixCache(RadixCache):
         try:
             for req_id in list(self._bypass_load_state.keys()):
                 self._abort_async_load(req_id)
+            # The device-load thread is joined by now, so every parked task's GET
+            # has finished and its slots are safe to hand back.
+            self._sweep_orphaned_device_tasks(len(self._orphaned_device_tasks))
         except Exception:
             logger.exception("Force release pending async device loads failed.")
 
@@ -679,15 +720,21 @@ class HiRadixCache(RadixCache):
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
-                if entry is not None:
-                    if self.l2_bypass:
+                if self.l2_bypass:
+                    # The reaper may have got here first (a stale pin it cancelled
+                    # is still acked by the backup thread); then the pin is already
+                    # gone and this ack is a no-op. Whichever side loses the race
+                    # must not double-release.
+                    self._device_pin_ops.pop(ack_id, None)
+                    released = self._device_pins.pop(ack_id)
+                    if entry is not None and released is not None:
                         # Deferred device-slot unlock: the device->L3 PUT has acked,
                         # so the GPU slot is no longer an in-flight RDMA source and
                         # may be evicted. (Pinned at write_backup via inc_lock_ref.)
                         # Task 4: the DSA sidecar is device-direct (no host staging).
                         self.dec_lock_ref(entry)
-                    else:
-                        entry.release_host()
+                elif entry is not None:
+                    entry.release_host()
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -810,6 +857,12 @@ class HiRadixCache(RadixCache):
         # background device-load thread (so no GET is still running) and the KV pool
         # is wiped below, so the tasks' GPU slots go with it. Just drop the handles.
         self._bypass_load_state.clear()
+        # Deferred device pins reference nodes of the tree being wiped, and
+        # cache_controller.reset() already joined the backup thread. Drop the
+        # ledger with them (no dec_lock_ref: the whole tree goes).
+        self._device_pins.drain()
+        self._device_pin_ops.clear()
+        self._orphaned_device_tasks.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1055,12 +1108,20 @@ class HiRadixCache(RadixCache):
             else None
         )
 
-        operation_id = self.cache_controller.write_storage_device(
+        operation = self.cache_controller.write_storage_device(
             device_value, key, hash_value, prefix_keys
         )
         # Track by op id for the deferred device-slot unlock at _drain_backup.
         # No protect_host(): the slot is pinned by lock_ref, not host_ref.
-        self.ongoing_backup[operation_id] = node
+        self.ongoing_backup[operation.id] = node
+        # Ledger the pin so it is bounded and countable: this is the only lock in
+        # the bypass design whose release depends on an external system (the L3
+        # PUT), so a lost ack would hold GPU KV forever. Keeping the operation
+        # handle is what lets the reaper cancel it safely.
+        self._device_pins.add(
+            operation.id, node, len(device_value), time.monotonic()
+        )
+        self._device_pin_ops[operation.id] = operation
 
     def _walk_split_chain(self, node: TreeNode, backup_len: int):
         """Walk the split chain and recover enqueue-time (chain, top, key, hash)."""
@@ -1251,6 +1312,13 @@ class HiRadixCache(RadixCache):
         else:
             num_evicted = self._evict_write_through(num_tokens)
         self.update_eviction_metrics(num_evicted, start_time)
+        if self.l2_bypass and num_evicted < num_tokens:
+            # Could not free what was asked: under bypass the usual reason is that
+            # device tokens are pinned waiting on a device->L3 backup ack. Say so
+            # explicitly, and say how much of it nothing can account for.
+            self._log_device_pin_audit(
+                f"evict short {num_evicted}/{num_tokens} tokens"
+            )
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _make_eviction_heap(self):
@@ -1759,6 +1827,8 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+            if self.l2_bypass:
+                self._check_device_pin_health()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1771,22 +1841,194 @@ class HiRadixCache(RadixCache):
         """
         cc = self.cache_controller
 
+        if self.l2_bypass:
+            # A dead backup thread strands every queued op's GPU KV pin, so check
+            # liveness before measuring the queues: recovery force-acks the backlog
+            # into ack_backup_queue and this round's MIN then releases it.
+            cc.recover_dead_backup_thread()
+            n_reap = len(
+                self._device_pins.reapable(
+                    time.monotonic(), self._device_pin_timeout
+                )
+            )
+            n_orphan = self._count_ready_orphaned_tasks()
+        else:
+            n_reap = n_orphan = 0
+
         qsizes = torch.tensor(
             [
                 cc.prefetch_revoke_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
+                n_reap,
+                n_orphan,
             ],
             dtype=torch.int,
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        n_revoke, n_backup, n_release, n_reap, n_orphan = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
+        )
+        if n_reap:
+            self._reap_stale_device_pins(n_reap)
+        if n_orphan:
+            self._sweep_orphaned_device_tasks(n_orphan)
+
+    def _reap_stale_device_pins(self, limit: int) -> None:
+        """Reclaim device pins whose device->L3 PUT never acked.
+
+        This is the backstop for the structural hazard of L2-bypass: the GPU KV
+        slot is the RDMA source for its own backup, so its `lock_ref` is released
+        by an *external* event. Ack-only means any lost ack holds that slot for the
+        life of the process, and enough of them wedge the instance (zero running
+        requests, ~99% pool usage, nothing evictable). Past
+        SGLANG_HICACHE_L2_BYPASS_PIN_TIMEOUT_S the pin is reclaimed instead.
+
+        Two invariants make this safe:
+
+        * **No RDMA under the reclaim.** A pin is released only if `try_cancel()`
+          wins the race against the backup thread's `try_start()`. An op whose PUT
+          already began keeps its pin (freeing the slot would let the NIC publish
+          another request's KV under this page's hash); it is only counted and
+          logged. A stuck PUT therefore blocks exactly one op, not the backlog.
+        * **TP symmetry.** `limit` is the cross-rank MIN of each rank's reapable
+          count and the ledger yields stale pins oldest-op-id first, so every rank
+          releases the same pins in the same order — no `dec_lock_ref` divergence.
+
+        A reclaimed page was never written to L3, so its claim is cleared and it
+        recomputes; that is a hit-rate cost, not a correctness one.
+        """
+        stale = self._device_pins.reapable(time.monotonic(), self._device_pin_timeout)
+        reclaimed_here = stuck_here = tokens_here = 0
+        for record in stale[:limit]:
+            operation = self._device_pin_ops.get(record.op_id)
+            if operation is not None and not operation.try_cancel():
+                # PUT already in flight: the slot is still being read. Hold the pin.
+                stuck_here += 1
+                continue
+            self._device_pins.pop(record.op_id)
+            self._device_pin_ops.pop(record.op_id, None)
+            node = self.ongoing_backup.pop(record.op_id, None)
+            if node is None:
+                continue
+            # The page never reached L3: drop the claim so the marker walk does not
+            # advertise it as loadable. The node is still device-resident here, so
+            # this creates no gap; once evicted it simply recomputes.
+            node.l3_backed = False
+            self.dec_lock_ref(node)
+            reclaimed_here += 1
+            tokens_here += record.tokens
+
+        self._device_pin_reclaimed_ops += reclaimed_here
+        self._device_pin_reclaimed_tokens += tokens_here
+        self._device_pin_stuck_ops += stuck_here
+        if reclaimed_here or stuck_here:
+            logger.warning(
+                "l2bypass: reclaimed %d stale device pin(s) (%d tokens) past the "
+                "%.0fs backup-ack deadline; %d more still have a PUT in flight. "
+                "Cumulative: %d ops / %d tokens reclaimed. Device->L3 backups are "
+                "not acking — check the storage backend.",
+                reclaimed_here,
+                tokens_here,
+                self._device_pin_timeout,
+                stuck_here,
+                self._device_pin_reclaimed_ops,
+                self._device_pin_reclaimed_tokens,
+            )
+
+    def _check_device_pin_health(self) -> None:
+        """Warn while the pool is still healthy, not after it has wedged.
+
+        Deferred device pins are supposed to clear in milliseconds (one L3 PUT).
+        A pin held for minutes, or a large share of the pool sitting pinned, is the
+        early form of exactly the failure this backstop exists for — surface it
+        with the numbers needed to tell "the backend is slow" from "acks stopped".
+        Cheap: no tree walk, and throttled to one line per half-minute."""
+        census = self._device_pins.census(time.monotonic())
+        if not census.ops:
+            return
+        pool = getattr(self.cache_controller.mem_pool_device_allocator, "size", 0)
+        share = census.tokens / pool if pool else 0.0
+        if census.oldest_age < 30.0 and share < 0.25:
+            return
+        now = time.monotonic()
+        if now - self._device_pin_census_logged < 30.0:
+            return
+        self._device_pin_census_logged = now
+        logger.warning(
+            "l2bypass device-pin pressure: %d un-acked device->L3 backup(s) are "
+            "holding %d GPU tokens (%.1f%% of the pool), oldest %.0fs. Pins clear "
+            "only when the PUT acks, so this is the leading edge of a pool wedge. "
+            "census=%s",
+            census.ops,
+            census.tokens,
+            share * 100.0,
+            census.oldest_age,
+            self.device_pin_census(),
+        )
+
+    def device_pin_census(self) -> dict:
+        """Health snapshot of the L2-bypass device pins — the numbers to look at
+        first when the pool fills with no requests running."""
+        cc = self.cache_controller
+        census = self._device_pins.census(time.monotonic())
+        return {
+            "pending_backup_ops": census.ops,
+            "pinned_tokens": census.tokens,
+            "oldest_pin_age_s": round(census.oldest_age, 1),
+            "reclaimed_ops": self._device_pin_reclaimed_ops,
+            "reclaimed_tokens": self._device_pin_reclaimed_tokens,
+            "stuck_ops": self._device_pin_stuck_ops,
+            "backup_failed_ops": cc.backup_failed_ops,
+            "backup_cancelled_ops": cc.backup_cancelled_ops,
+            "backup_thread_restarts": cc.backup_thread_restarts,
+            "backup_thread_alive": bool(
+                cc.backup_thread is not None and cc.backup_thread.is_alive()
+            ),
+            "protected_size": self.protected_size_,
+            "evictable_size": self.evictable_size_,
+            "in_flight_loads": len(self.ongoing_load_back),
+            "in_flight_device_reads": len(self._bypass_load_state),
+        }
+
+    def _log_device_pin_audit(self, reason: str) -> None:
+        """Attribute every locked node to an owner and log the unattributable ones.
+
+        This is the "one look" answer to a full pool with no requests running: it
+        separates device tokens legitimately held by an in-flight backup or load
+        from `lock_ref`s that nothing will ever release. Walks the tree, so it is
+        called only on the cold path (eviction fell short) and throttled.
+        """
+        now = time.monotonic()
+        if now - self._device_pin_audit_logged < 10.0:
+            return
+        self._device_pin_audit_logged = now
+
+        load_pinned = list(self.ongoing_load_back.values())
+        load_pinned.extend(s.ancestor for s in self._bypass_load_state.values())
+        audit = audit_pins(
+            self.root_node, list(self.ongoing_backup.values()), load_pinned
+        )
+        logger.warning(
+            "l2bypass pin audit (%s): locked %d nodes / %d tokens = "
+            "%d/%d by pending L3 backup + %d/%d by in-flight load + "
+            "%d/%d UNACCOUNTED (leaked lock_ref, sample ids=%s). census=%s",
+            reason,
+            audit.locked_nodes,
+            audit.locked_tokens,
+            audit.backup_pinned_nodes,
+            audit.backup_pinned_tokens,
+            audit.load_pinned_nodes,
+            audit.load_pinned_tokens,
+            audit.orphan_nodes,
+            audit.orphan_tokens,
+            audit.orphan_sample,
+            self.device_pin_census(),
         )
 
     # Timeout is linearly increasing with the number of pages
@@ -2053,12 +2295,40 @@ class HiRadixCache(RadixCache):
     def _poll_l3_async_load(self, req_id: str) -> bool:
         """Rounds 2..N: one balanced TP MIN over every rank's 0/1 background-done
         flag. Park (return False) until the slowest rank's local GET has landed;
-        then promote."""
+        then promote.
+
+        A second flag deadlines the park. Nothing else can end it: the request sits
+        in the waiting queue, so it is never scheduled and never aborted, and its
+        GPU slots plus the ancestor pin would be held for the life of the process if
+        the backend stopped answering. It is carried NEGATED in the same MIN reduce,
+        which makes it an OR — one stalled rank aborts all of them, keeping the tree
+        symmetric — while staying a single collective per round."""
         state = self._bypass_load_state[req_id]
         local_done = 1 if state.task.done.is_set() else 0
-        done_t = torch.tensor(local_done, dtype=torch.int)
-        self._all_reduce_attn_groups(done_t, torch.distributed.ReduceOp.MIN)
-        if done_t.item() == 0:
+        stalled = (
+            1
+            if (
+                not local_done
+                and self._device_load_timeout > 0
+                and time.monotonic() - state.submitted_at > self._device_load_timeout
+            )
+            else 0
+        )
+        flags = torch.tensor([local_done, -stalled], dtype=torch.int)
+        self._all_reduce_attn_groups(flags, torch.distributed.ReduceOp.MIN)
+        done, stalled_any = (int(flags[0].item()), -int(flags[1].item()))
+        if stalled_any:
+            logger.error(
+                "l2bypass: async device load for req %s exceeded %.0fs with no "
+                "response from the storage backend; abandoning it so its %d GPU "
+                "tokens are not held forever. Tokens recompute.",
+                req_id,
+                self._device_load_timeout,
+                state.device_tokens,
+            )
+            self._abort_async_load(req_id)
+            return True
+        if done == 0:
             return False
         return self._promote_l3_async_load(req_id, state)
 
@@ -2150,21 +2420,52 @@ class HiRadixCache(RadixCache):
         return True
 
     def _abort_async_load(self, req_id: str) -> None:
-        """Tear down an in-flight async device load (abort/detach). Wait for the
-        background GET to finish before freeing its GPU slots (the NIC may still be
-        writing them; the GET is a bounded RDMA op), then free slots + staging, drop
-        the markers, release the ancestor pin and the device-token charge."""
+        """Tear down an in-flight async device load (abort/detach/stall).
+
+        Everything except the slot free is unconditional: markers dropped, ancestor
+        pin released, device-token charge returned. The slots are different, for two
+        reasons, and both are why the task is parked in `_orphaned_device_tasks`
+        rather than freed here:
+
+        * the NIC may still be writing them, and handing them back to the allocator
+          under an in-flight RDMA would let the GET overwrite whatever request gets
+          those slots next (this used to be a blocking 30s wait that freed anyway
+          once it expired — a stall turned into silent KV corruption);
+        * the free must happen on the same step on every rank, or allocator state
+          diverges across TP. The parked list is swept FIFO under a cross-rank MIN
+          of ready tasks, which gives exactly that.
+
+        Deliberately deferred, never dropped: `_sweep_orphaned_device_tasks`
+        reclaims each task as soon as its `done` fires."""
         state = self._bypass_load_state.pop(req_id, None)
         if state is None:
             return
-        # Bounded wait: don't free slots out from under an in-flight RDMA write.
-        state.task.done.wait(timeout=30)
-        self.cache_controller.free_device_load(state.task)
+        self._orphaned_device_tasks.append(state.task)
         self._drop_l3_markers(state.nodes_to_load)
         self.dec_lock_ref(state.ancestor)
         self.cache_controller.prefetch_tokens_occupied -= state.device_tokens
         if self.cache_controller.prefetch_tokens_occupied < 0:
             self.cache_controller.prefetch_tokens_occupied = 0
+
+    def _sweep_orphaned_device_tasks(self, limit: int) -> None:
+        """Free the GPU slots of aborted loads whose GET has since landed.
+
+        `limit` is the cross-rank MIN of each rank's ready count, and the list is
+        FIFO, so every rank frees the same tasks in the same order — allocator
+        state stays identical across ranks."""
+        for _ in range(limit):
+            task = self._orphaned_device_tasks.pop(0)
+            self.cache_controller.free_device_load(task)
+
+    def _count_ready_orphaned_tasks(self) -> int:
+        """Length of the leading run of parked tasks whose GET has landed. A run,
+        not a count, so the FIFO order the sweep relies on is preserved."""
+        ready = 0
+        for task in self._orphaned_device_tasks:
+            if not task.done.is_set():
+                break
+            ready += 1
+        return ready
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if self.l2_bypass:

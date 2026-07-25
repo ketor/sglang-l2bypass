@@ -19,6 +19,7 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
+    DevicePinCancelMixin,
     LayerDoneCounter,
 )
 from sglang.srt.managers.cache_controller import (
@@ -116,6 +117,29 @@ class StorageOperation(BaseStorageOperation):
         super().__init__(host_indices, token_ids, last_hash, hash_value, prefix_keys)
         self.pool_transfers = pool_transfers
         self.pool_storage_result = PoolTransferResult.empty()
+
+
+class DeviceStorageOperation(DevicePinCancelMixin, StorageOperation):
+    """DSA L2-bypass device->L3 backup op. Same start/cancel arbitration as the
+    dense one (see DevicePinCancelMixin) — the DSA indexer sidecar rides the same
+    GPU slots, so one pin covers both and one cancel protects both."""
+
+    def __init__(
+        self,
+        device_indices: torch.Tensor,
+        token_ids: List[int],
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ):
+        self._init_pin_state()
+        super().__init__(
+            device_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            pool_transfers=pool_transfers,
+        )
 
 
 class PrefetchOperation(StorageOperation):
@@ -521,13 +545,17 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
-    ) -> int:
+    ) -> DeviceStorageOperation:
         """DSA L2-bypass storage backup: the operation's host_indices field carries
         the main-KV DEVICE slot indices (SG put from GPU). Task 4: the indexer sidecar
         is device-direct too and rides those same slots, so _page_backup_device
         derives its DEVICE sidecar transfers from _sidecar_entries() and does not need
-        extra_pools (kept for signature compatibility; unused under bypass)."""
-        operation = StorageOperation(
+        extra_pools (kept for signature compatibility; unused under bypass).
+
+        Returns the OPERATION (mirroring the dense override): the caller holds the
+        GPU slots pinned until this op acks and needs the handle to cancel it if the
+        ack never comes."""
+        operation = DeviceStorageOperation(
             device_indices,
             token_ids,
             hash_value=hash_value,
@@ -535,7 +563,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
         )
         self.backup_queue.put(operation)
-        return operation.id
+        return operation
 
     def start_writing(self) -> None:
         if not self.write_queue:

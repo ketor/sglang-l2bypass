@@ -242,6 +242,66 @@ class StorageOperation:
         return self.id < other.id
 
 
+class DevicePinCancelMixin:
+    """Start/cancel arbitration for an L2-bypass device->L3 backup op.
+
+    Such an op's `host_indices` field carries GPU KV slot indices, and those slots
+    stay pinned unevictable (lock_ref) until the op acks. Because that pin outlives
+    the scheduler step and depends on an external backend, it needs an escape hatch
+    for when the ack never comes. `try_start` / `try_cancel` are the two ends of
+    that hatch and are mutually exclusive under one lock:
+
+      * the backup thread calls `try_start()` before issuing the PUT — a False
+        means the reaper already released the slots, so the RDMA must NOT run
+        (reading a slot the tree has since handed to another request would publish
+        that request's KV under this page's hash — silent wrong-KV on every later
+        read);
+      * the stale-pin reaper calls `try_cancel()` — a False means the PUT is
+        already in flight and the pin must be held.
+
+    Only bypass device backups pay for the lock; the stock host path keeps using
+    the plain StorageOperation.
+    """
+
+    def _init_pin_state(self) -> None:
+        self._pin_state_lock = threading.Lock()
+        self.started = False
+        self.cancelled = False
+
+    def try_start(self) -> bool:
+        """Backup thread: claim the op for a PUT. False if it was cancelled."""
+        with self._pin_state_lock:
+            if self.cancelled:
+                return False
+            self.started = True
+            return True
+
+    def try_cancel(self) -> bool:
+        """Reaper (scheduler thread): claim the op for release. False if the PUT
+        already started, in which case the pin must stay."""
+        with self._pin_state_lock:
+            if self.started:
+                return False
+            self.cancelled = True
+            return True
+
+
+class DeviceStorageOperation(DevicePinCancelMixin, StorageOperation):
+    """Dense L2-bypass device->L3 backup op. See DevicePinCancelMixin."""
+
+    def __init__(
+        self,
+        device_indices: torch.Tensor,
+        token_ids: List[int],
+        hash_value: Optional[List[str]] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ):
+        self._init_pin_state()
+        super().__init__(
+            device_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+        )
+
+
 class PrefetchOperation(StorageOperation):
     def __init__(
         self,
@@ -328,6 +388,15 @@ class HiCacheController:
         # threads only when l2_bypass and async read are on). None otherwise.
         self.device_load_queue: Optional[Queue] = None
         self.device_load_thread: Optional[threading.Thread] = None
+        # L2-bypass device-pin health counters. Under bypass the GPU KV slot is the
+        # RDMA source for the device->L3 PUT, so it stays lock_ref'd until that PUT
+        # acks — the one lock in the design whose release depends on something
+        # outside this process. These make every way that ack can go wrong countable
+        # instead of silent. Always zero off bypass.
+        self.backup_failed_ops = 0  # PUT raised; acked anyway to free the slots
+        self.backup_cancelled_ops = 0  # reaper reclaimed the pin before the PUT ran
+        self.backup_thread_restarts = 0  # backup thread died and was respawned
+        self.backup_force_acked_ops = 0  # backlog force-acked after a thread death
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -1626,16 +1695,20 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> int:
+    ) -> DeviceStorageOperation:
         """L2-bypass backup: same as write_storage, but the operation's
         `host_indices` field carries DEVICE slot indices. The backup thread's
         page_set_func (_page_set_zero_copy_device) reads device page meta and
-        RDMAs straight from the GPU KV slots."""
-        operation = StorageOperation(
+        RDMAs straight from the GPU KV slots.
+
+        Returns the OPERATION (not just its id, as write_storage does): the caller
+        holds the GPU slots pinned until this op acks and needs the handle to
+        cancel it if the ack never comes."""
+        operation = DeviceStorageOperation(
             device_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
         self.backup_queue.put(operation)
-        return operation.id
+        return operation
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
@@ -1778,8 +1851,95 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup(operation)
+                    if isinstance(operation, DevicePinCancelMixin):
+                        self._run_device_backup(operation)
+                    else:
+                        self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue
+
+    def recover_dead_backup_thread(self) -> int:
+        """L2-bypass watchdog: if the backup thread died, force-ack its backlog and
+        respawn it. Returns the number of ops force-acked (0 when healthy).
+
+        The backup thread holds GPU KV pins: every queued op's slots stay
+        unevictable until it acks. If the thread is gone, nothing will ever ack
+        them, so the pool bleeds down until the scheduler wedges. `_run_device_backup`
+        makes ordinary backend errors survivable; this covers what it cannot
+        (BaseException, a killed thread, a bug in the loop itself).
+
+        Force-acking the backlog is safe precisely BECAUSE the thread is dead: no
+        PUT can be in flight, so no NIC is reading the slots we are about to unpin.
+        The ops are acked, not run, so their pages simply recompute. Draining in
+        FIFO order keeps `ack_backup_queue` the same sequence on every rank, which
+        is what the MIN-gated drain in the tree relies on.
+        """
+        if not self.enable_storage or not self.l2_bypass:
+            return 0
+        thread = self.backup_thread
+        if thread is None or thread.is_alive() or self.storage_stop_event.is_set():
+            return 0
+
+        forced = 0
+        while True:
+            try:
+                operation = self.backup_queue.get_nowait()
+            except Empty:
+                break
+            if operation is None:
+                continue
+            self.ack_backup_queue.put(operation)
+            forced += 1
+
+        self.backup_force_acked_ops += forced
+        self.backup_thread_restarts += 1
+        self.backup_thread = threading.Thread(
+            target=self.backup_thread_func, daemon=True
+        )
+        self.backup_thread.start()
+        logger.error(
+            "L2-bypass: the storage backup thread had DIED; force-acked %d queued "
+            "op(s) to release their GPU KV pins and respawned it (restart #%d). "
+            "Those pages were not written to L3 and will recompute.",
+            forced,
+            self.backup_thread_restarts,
+        )
+        return forced
+
+    def _run_device_backup(self, operation) -> None:
+        """L2-bypass backup body. Two things the stock path does not need:
+
+        1. **Cancel arbitration.** If the stale-pin reaper already released this
+           op's GPU slots, the tree may have handed them to another request — the
+           PUT must not read them (it would store that request's KV under this
+           page's hash). `try_start()` losing the race is the signal to skip.
+        2. **The ack is mandatory.** Off bypass, this op's ack only drops a host
+           protection; under bypass it is the ONLY thing that unpins the GPU KV
+           slots. A backend exception must therefore never kill this thread nor
+           drop the ack — that is a monotonic, unrecoverable device-memory leak
+           that wedges the instance (zero running requests, 99% pool usage).
+           Off bypass this method is not reached at all, so stock behavior
+           (fail-fast, thread dies) is unchanged.
+        """
+        if not operation.try_start():
+            self.backup_cancelled_ops += 1
+            logger.warning(
+                "device->L3 backup op %d was cancelled (stale pin reclaimed); "
+                "skipping the PUT, its %d pages recompute.",
+                operation.id,
+                len(operation.hash_value),
+            )
+            return
+        try:
+            self._page_backup(operation)
+        except Exception:
+            self.backup_failed_ops += 1
+            logger.exception(
+                "device->L3 backup op %d raised; acking anyway so its GPU KV slots "
+                "are released (%d/%d tokens written).",
+                operation.id,
+                operation.completed_tokens,
+                len(operation.hash_value) * self.page_size,
+            )

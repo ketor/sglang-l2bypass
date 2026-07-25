@@ -37,6 +37,7 @@ read-only over the matching site-packages file):
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hicache_storage.py:$SGLANG/srt/mem_cache/hicache_storage.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_page_meta.py:$SGLANG/srt/mem_cache/device_page_meta.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/l3_marker_state.py:$SGLANG/srt/mem_cache/l3_marker_state.py:ro
+-v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/device_pin_ledger.py:$SGLANG/srt/mem_cache/device_pin_ledger.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/managers/cache_controller.py:$SGLANG/srt/managers/cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/hybrid_cache/hybrid_cache_controller.py:$SGLANG/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:ro
 -v /home/ketor/Code/git/ketor/sglang-l2bypass/patched/mem_cache/pool_host/base.py:$SGLANG/srt/mem_cache/pool_host/base.py:ro
@@ -1426,3 +1427,148 @@ Reproduction to re-run after the fix: `warmup.sh` v2 (concurrent, mixed lengths)
   round or two), but it is the reason `_l3_gap_count` is worth watching.
 - Not GPU-verified on this box (no torch) — same standing caveat as increments
   1-7.
+
+---
+
+# Increment 7.2 — bound the deferred device pin (GPU KV slot leak / pool wedge)
+
+Fixes the long-soak wedge: after 8-10 rounds the instance stopped with
+
+```
+Prefill batch, #new-seq: 1, #new-token: 64, #cached-token: 0, token usage: 0.99,
+#running-req: 0, #queue-req: 0
+```
+
+— **no requests running or queued, yet the KV pool 99% full**, health checks
+failing, never recovering. No assert, no crash, no GPU-memory growth: the tokens
+were not lost, they were *locked*.
+
+## Root cause: the one lock released by an external event
+
+Increment 1 made the GPU KV slot the RDMA source for its own device->L3 backup,
+so it must stay unevictable until that PUT completes. The pin is therefore taken
+at write-through enqueue (`hiradix_cache._write_backup_device` -> `inc_lock_ref`)
+and released only at the **storage backup ack** (`_drain_backup` ->
+`dec_lock_ref`), five hops later:
+
+```
+_write_backup_device        inc_lock_ref(node)          [scheduler]
+  -> ongoing_write_through
+  -> writing_check -> _finish_write_through_ack
+  -> _write_backup_storage_device -> ongoing_backup[op.id]
+  -> backup_thread_func -> _page_backup -> batch_set_v*_device   [backup thread]
+  -> ack_backup_queue
+  -> _drain_backup            dec_lock_ref(node)        [scheduler]
+```
+
+Stock never has this exposure. There the pin is released at the *D2H* ack — local,
+bounded, CUDA-event-driven — and the storage backup only holds a `protect_host()`,
+which cannot wedge device memory. Under bypass the same chain holds HBM, and it
+has an unguarded break in the middle: `backup_thread_func`
+(`managers/cache_controller.py:1838`) catches only `Empty`, so **any** exception
+out of `_page_backup` / `_page_backup_device` (i.e. out of the dfkv
+`batch_set_v1_device` / `batch_set_v2_device` call) kills the backup thread. From
+that instant nothing ever acks again: every subsequent write-through pins its
+slots permanently, `protected_size_` climbs monotonically, `evictable_size_` goes
+to zero, and `PrefillAdder`'s `available_size() + evictable_size()` reaches zero
+— which is precisely "zero requests, 99% usage, wedged". Abrupt onset after N
+healthy rounds is the signature of a single fatal op, not of gradual pressure.
+
+Two smaller holds on the same theme, both unbounded, were found alongside it:
+
+* `_poll_l3_async_load` parked a request forever if its background GET never
+  returned. A parked request is in the waiting queue, so it is never scheduled and
+  never aborted — its GPU slots and ancestor pin had no release path at all.
+* `_abort_async_load` waited 30s for the GET then **freed the slots regardless**.
+  On a stall that hands slots the NIC is still writing back to the allocator:
+  silent wrong-KV, not just a leak.
+
+## Fix
+
+**1. The ack becomes mandatory** (`cache_controller._run_device_backup`). Bypass
+device backups run through a body that always acks, whatever the backend does.
+Off bypass the method is not reached and a raising `_page_backup` still kills the
+thread exactly as stock — flag-off behavior unchanged.
+
+**2. Thread-death recovery** (`cache_controller.recover_dead_backup_thread`,
+called from `drain_storage_control_queues`). If the thread dies anyway
+(BaseException, kill), its backlog is force-acked and the thread respawned. Safe
+*because* the thread is dead: no PUT can be in flight, so no NIC is reading the
+slots being unpinned. FIFO drain keeps `ack_backup_queue` identical across ranks.
+
+**3. Stale-pin reaper** (`hiradix_cache._reap_stale_device_pins`, deadline
+`SGLANG_HICACHE_L2_BYPASS_PIN_TIMEOUT_S`, default 120s). Backstop for any lost ack
+we have not diagnosed. Two invariants:
+
+* *No RDMA under the reclaim.* A pin is released only if `try_cancel()` beats the
+  backup thread's `try_start()` (`DevicePinCancelMixin`, one lock, mutually
+  exclusive). An op whose PUT already began keeps its pin and is only counted —
+  freeing it would let the NIC publish another request's KV under this page's
+  hash. One stuck PUT blocks one op, not the backlog.
+* *TP symmetry.* The reap count is the cross-rank MIN (4th slot of the existing
+  `drain_storage_control_queues` all_reduce, so no extra collective) and
+  `DevicePinLedger.reapable` yields stale pins oldest-op-id first — every rank
+  releases the same pins in the same order, no `dec_lock_ref` divergence.
+
+A reclaimed page never reached L3, so its `l3_backed` claim is cleared and it
+recomputes: a hit-rate cost, not a correctness one.
+
+**4. Async-load deadline + deferred slot free.** `_poll_l3_async_load` carries a
+negated stall flag inside its existing MIN reduce (an OR: one stalled rank aborts
+all, still one collective per round; `SGLANG_HICACHE_L2_BYPASS_LOAD_TIMEOUT_S`,
+default 180s). `_abort_async_load` no longer blocks and no longer frees under an
+in-flight GET — the task is parked in `_orphaned_device_tasks` and swept once
+`done` fires, FIFO, under a cross-rank MIN (5th slot of the same all_reduce) so
+allocator state stays identical across ranks. Deferred, never dropped.
+
+## Observability
+
+- `device_pin_census()` — pending backup ops, pinned tokens, oldest pin age,
+  reclaimed/stuck counts, backup-thread alive + restart count, protected vs
+  evictable size, in-flight loads.
+- `_check_device_pin_health()` (every step, throttled 30s, no tree walk) warns
+  once pins exceed 30s or 25% of the pool — the *leading edge* of a wedge.
+- `_log_device_pin_audit()` fires when eviction falls short and answers the
+  question directly: locked tokens split into *by pending L3 backup* / *by
+  in-flight load* / **UNACCOUNTED** with sample node ids. Unaccounted > 0 is a
+  `lock_ref` nothing will release — exactly the "lock_ref>0 with no in-flight
+  task" signal, and where to look next time.
+
+## Files
+
+- `mem_cache/device_pin_ledger.py` (NEW, torch-free) — ledger + `audit_pins`.
+  **Needs a new bind-mount** (added to the list above).
+- `managers/cache_controller.py` — `DevicePinCancelMixin`,
+  `DeviceStorageOperation`, `_run_device_backup`, `recover_dead_backup_thread`,
+  health counters. `write_storage_device` now returns the operation (bypass-only
+  method, single caller) so the tree can cancel it.
+- `mem_cache/hybrid_cache/hybrid_cache_controller.py` — DSA
+  `DeviceStorageOperation` (the indexer sidecar rides the same slots, so one pin
+  covers both and one cancel protects both).
+- `mem_cache/hiradix_cache.py` — ledger wiring, reaper, orphan sweep, async-load
+  deadline, census/audit.
+
+## Flag-off equivalence
+
+Every hunk is behind `self.l2_bypass` or on a bypass-only method. The one
+unconditional change is the `drain_storage_control_queues` all_reduce going from
+3 to 5 elements: deliberately fixed-shape regardless of the flag, because
+`l2_bypass` is resolved per-rank at attach and a flag-dependent tensor shape would
+hang NCCL if ranks ever disagreed.
+
+## Tests
+
+`tests/test_device_pin_ledger.py` (NEW, 27 cases, pure python): ledger
+bookkeeping; reap order is oldest-op-first (the TP-symmetry property); the
+cancel/start arbitration is exclusive under 200 rounds of real thread
+contention; and a lock-balance harness covering every exit path — normal ack,
+lost ack reclaimed by deadline, late ack after a reap, reap after an ack,
+in-flight PUT keeps its pin then releases normally, one stuck op not blocking the
+backlog, MIN-capped reap taking the oldest prefix, mixed sequences, and
+thread-death drain — each asserting the chain's `lock_ref` returns to zero and the
+ledger empties. Plus `audit_pins` attribution incl. the orphan case.
+
+`py_compile` clean. All 5 existing suites still pass (marker state / async read /
+device page meta / fused draft gate / stub host pool).
+
+Not GPU-verified on this box (no torch) — same standing caveat as increments 1-7.
