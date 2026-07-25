@@ -274,6 +274,14 @@ class HiRadixCache(RadixCache):
         self._bypass_dedup_pages_saved = 0
         self._bypass_dedup_wait_timeouts = 0
         self._dedup_logged_at = 0.0
+        # L3 命中崩塌检测(七期)。故障签名: exist 报页在 L3、紧接着的 device GET 却
+        # 整批 0 命中，于是丢 marker 重算。单次是正常降级；但连续发生就意味着 L3
+        # 对这个实例已经失效，而它**完全静默**——表现只是"这一轮慢了点"，运维侧与
+        # 正常波动无法区分。2026-07-26 那次 0% 崩溃是事后翻日志才发现的。
+        # 这里不试图修复(根因未明)，只保证它发生时立刻可见。
+        self._l3_load_ok = 0
+        self._l3_load_fail = 0
+        self._l3_collapse_logged_at = 0.0
         # SGLANG_HICACHE_L2_BYPASS_DEDUP=0 reverts to the increment-3 behaviour
         # (every request issues its own GET, duplicates included). Same keys, same
         # bytes, same results either way — purely a duplicate-op knob, kept so the
@@ -2465,6 +2473,7 @@ class HiRadixCache(RadixCache):
                 req_id,
                 len(nodes_to_load),
             )
+            self._note_l3_load_outcome(ok=False)
             return True
 
         # DSA/hybrid: H2D the verified sidecar prefix on THIS (scheduler) thread.
@@ -2507,6 +2516,7 @@ class HiRadixCache(RadixCache):
             self.dec_lock_ref(ancestor)
             return True
 
+        self._note_l3_load_outcome(ok=True)
         self.evictable_size_ += offset
         last_loaded = plan.assign[-1][0]
         # inc_lock_ref(last_loaded) pins the whole loaded chain up to root; the
@@ -2540,6 +2550,45 @@ class HiRadixCache(RadixCache):
             len(self._bypass_waiters),
             self._bypass_dedup_wait_timeouts,
         )
+
+    def _note_l3_load_outcome(self, ok: bool) -> None:
+        """Record one device-load outcome and shout when L3 has effectively died.
+
+        The failure this watches for (七期): `batch_exists` reports the pages ARE
+        in L3, the device GET that immediately follows returns 0 hits for every
+        sub-object, the markers get dropped and everything recomputes. One
+        occurrence is a legitimate degrade path. A sustained run of them means L3
+        is doing nothing for this instance — and it is **completely silent**: from
+        the outside the round merely looks slow, indistinguishable from normal
+        variance. The 2026-07-26 0%-hit round was only found by reading logs after
+        the fact.
+
+        This does NOT attempt a repair — the trigger is not understood, and
+        inventing a "fix" for an un-diagnosed fault is how you get a second bug.
+        It only guarantees the condition is visible when it happens.
+
+        Fires at most once a minute, and only once there is enough signal to be
+        meaningful (>= 8 loads in the window) with a failure share >= 50%."""
+        if ok:
+            self._l3_load_ok += 1
+        else:
+            self._l3_load_fail += 1
+        total = self._l3_load_ok + self._l3_load_fail
+        if total < 8 or self._l3_load_fail * 2 < total:
+            return
+        now = time.monotonic()
+        if now - self._l3_collapse_logged_at < 60.0:
+            return
+        self._l3_collapse_logged_at = now
+        logger.error(
+            "🔴 L3 HIT COLLAPSE: %d/%d device loads returned 0 verified pages "
+            "(%.0f%%). exist said the pages were present, the GET found nothing, "
+            "so every one of them recomputed. L3 is effectively OFF for this "
+            "instance. Triage: compare dfkv server-side dfkv_cache_miss_total "
+            "(jumped => storage really lost the data; flat => the GET never "
+            "reached storage or was served as a hit) against the client-side "
+            "MISS/SHORT split in the dfkv access log.",
+            self._l3_load_fail, total, 100.0 * self._l3_load_fail / total)
 
     def _find_inflight_owner(self, nodes_to_load) -> Optional[str]:
         """req_id of the in-flight load covering the parent-most node of this chain
