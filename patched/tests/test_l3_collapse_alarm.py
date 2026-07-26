@@ -45,6 +45,8 @@ class C:
     def __init__(self):
         self._l3_recent = deque(maxlen=24)
         self._l3_collapse_logged_at = 0.0
+        self._l3_fail_total = 0
+        self._l3_fail_at_last_alarm = -1
 
 
 class Alarm(unittest.TestCase):
@@ -114,6 +116,30 @@ class Alarm(unittest.TestCase):
             src = f.read()
         self.assertIn("self._note_l3_load_outcome(ok=True)", src)
         self.assertIn("self._note_l3_load_outcome(ok=False)", src)
+
+
+    def test_stale_window_does_not_re_report_the_same_event(self):
+        """🔴 实测缺陷: 窗口只在有新 load 时才被冲淡。若系统在崩溃后空闲再恢复，
+        陈旧窗口会让同一次事件再响一遍(八期长稳里探路读的失败 11 分钟后又报了一次，
+        同为 4/4)，看日志的人会以为发生了新的崩塌。没有新失败就不该重报。"""
+        c = C()
+        for _ in range(4):
+            c.note(ok=False)
+        self.assertEqual(len(LOGS), 1)
+        clock.t += 600          # 过了节流窗，但期间没有任何新失败
+        c.note(ok=False if False else True)   # 一次成功，窗口仍是 3/4 失败
+        self.assertEqual(len(LOGS), 1, "陈旧窗口不得把旧事件重报为新崩塌")
+
+    def test_a_genuinely_new_failure_burst_does_re_report(self):
+        """但真有新失败时必须重报，否则第二次真故障会被静默吞掉。"""
+        c = C()
+        for _ in range(4):
+            c.note(ok=False)
+        self.assertEqual(len(LOGS), 1)
+        clock.t += 120
+        for _ in range(4):
+            c.note(ok=False)    # 新的失败
+        self.assertEqual(len(LOGS), 2, "新失败必须触发新告警")
 
 
 if __name__ == "__main__":

@@ -286,6 +286,12 @@ class HiRadixCache(RadixCache):
         #    A#1 真崩溃时告警没响，正是这两条一起造成的。
         self._l3_recent = deque(maxlen=24)
         self._l3_collapse_logged_at = 0.0
+        # 上次告警时的累计失败数。窗口只在**有新 load 进来**时才被冲淡，若系统在
+        # 崩溃后空闲一段再恢复，陈旧窗口会让同一次事件**再响一遍**，看日志的人会
+        # 以为发生了新的崩塌。实测: 八期长稳里探路读的一次失败在 11 分钟后又报了
+        # 一次(同为 "4/4 device loads")。只在失败数真的增加时才重报。
+        self._l3_fail_total = 0
+        self._l3_fail_at_last_alarm = -1
         # SGLANG_HICACHE_L2_BYPASS_DEDUP=0 reverts to the increment-3 behaviour
         # (every request issues its own GET, duplicates included). Same keys, same
         # bytes, same results either way — purely a duplicate-op knob, kept so the
@@ -2576,15 +2582,21 @@ class HiRadixCache(RadixCache):
         survive: cumulative counters go permanently silent once enough successes
         accumulate, which is exactly how the first version missed a real crash."""
         self._l3_recent.append(bool(ok))
+        if not ok:
+            self._l3_fail_total += 1
         total = len(self._l3_recent)
         fail = total - sum(self._l3_recent)
         # 最小样本 4: 单轮全崩通常只有 4 次 load，阈值定 8 会让它整轮沉默。
         if total < 4 or fail * 2 < total:
             return
+        # 没有新失败就不重报: 否则陈旧窗口会把一次旧事件反复呈现为新崩塌。
+        if self._l3_fail_total == self._l3_fail_at_last_alarm:
+            return
         now = time.monotonic()
         if now - self._l3_collapse_logged_at < 60.0:
             return
         self._l3_collapse_logged_at = now
+        self._l3_fail_at_last_alarm = self._l3_fail_total
         logger.error(
             "🔴 L3 HIT COLLAPSE: %d/%d device loads returned 0 verified pages "
             "(%.0f%%). exist said the pages were present, the GET found nothing, "
